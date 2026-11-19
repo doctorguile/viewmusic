@@ -24,7 +24,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use winit::event::WindowEvent;
+use winit::event::{ElementState, MouseButton, WindowEvent};
+use winit::keyboard::{Key, KeyCode, ModifiersState, PhysicalKey};
 use winit::window::Window;
 
 use viz_audio::{AudioHandle, CaptureState, PermissionState};
@@ -38,11 +39,14 @@ use crate::app_state::{
     PERMISSION_SETTINGS_PATH, PERMISSION_TITLE, PERMISSION_WAITING_HINT, PERMISSION_WHY,
     SETTINGS_URL, WAITING_FOR_AUDIO_HINT, WAITING_FOR_AUDIO_TITLE,
 };
-use crate::overlay::{decide_visibility, Overlay};
+use crate::overlay::{decide_visibility, Overlay, OVERLAY_AREA_ID};
 use crate::persist::{should_save_window, WindowState, WINDOW_SAVE_DEBOUNCE};
 use crate::runtime::{ArtifactRuntime, SettingValue};
 use crate::settings_panel::{SettingChange, SettingsPanel};
-use crate::window::{FrameContext, RenderCallback};
+use crate::window::{
+    apply_window_mode, apply_window_size_preset, detect_size_preset, FrameContext, RenderCallback,
+    WindowMode, WindowSizePreset,
+};
 
 /// Maximum `dt` (seconds) handed to the artifact in any one frame. A long stall
 /// (e.g. the app was backgrounded) must not teleport time-driven motion; the audio
@@ -89,6 +93,11 @@ pub struct OverlayRequest {
     /// Whether the user clicked "Open System Settings" on the permission guidance
     /// screen this frame. [`VizApp`] spawns `open(1)` after the egui pass.
     pub open_settings: bool,
+    /// Updated window presentation mode requested via the Window checkboxes (`None`
+    /// ⇒ no change).
+    pub set_window_mode: Option<WindowMode>,
+    /// Requested window-size preset clicked in the overlay (`None` ⇒ no change).
+    pub set_size_preset: Option<WindowSizePreset>,
 }
 
 impl OverlayRequest {
@@ -100,6 +109,8 @@ impl OverlayRequest {
             && !self.reset_settings
             && !self.reload_artifacts
             && !self.open_settings
+            && self.set_window_mode.is_none()
+            && self.set_size_preset.is_none()
     }
 }
 
@@ -132,6 +143,11 @@ pub struct OverlayModel {
     /// in the model so the egui closure can mutate its working values; [`VizApp`]
     /// rebinds it on an artifact switch.
     pub settings: SettingsPanel,
+    /// Current live window presentation flags (Borderless, Transparent, Always on top).
+    pub window_mode: WindowMode,
+    /// Detected active window-size preset for highlighting in the overlay, or `None`
+    /// when the window is at a custom size.
+    pub active_size_preset: Option<WindowSizePreset>,
     /// Perf-HUD display values (only populated with the `perf-hud` feature).
     #[cfg(feature = "perf-hud")]
     pub hud: crate::hud::HudSnapshot,
@@ -203,6 +219,10 @@ type CollapseChangeHook = Box<dyn FnMut(bool)>;
 /// persist its geometry.
 type WindowChangeHook = Box<dyn FnMut(WindowState)>;
 
+/// A callback invoked when any window presentation flag (borderless, transparent,
+/// always-on-top) changes, so the host can persist it immediately.
+type WindowModeChangeHook = Box<dyn FnMut(WindowMode)>;
+
 /// A callback invoked when a setting is edited or reset, so the host can persist the
 /// new per-artifact setting values. Receives the active artifact (for
 /// its id + declarations, so the host can encode each value per kind) and its full
@@ -254,6 +274,15 @@ pub struct VizApp {
     on_collapse_change: Option<CollapseChangeHook>,
     /// Optional hook to persist window geometry on move/resize.
     on_window_change: Option<WindowChangeHook>,
+    /// Optional hook to persist window mode flags on toggle.
+    on_window_mode_change: Option<WindowModeChangeHook>,
+    /// Current live window mode flags (borderless, transparent, always-on-top).
+    window_mode: WindowMode,
+    /// Latest keyboard modifier state (drives `Cmd+1..5`, `Cmd+W`, `Cmd+T` shortcuts).
+    modifiers: ModifiersState,
+    /// Whether the most recently rendered view was [`AppView::Active`], used to keep
+    /// non-Active guidance screens opaque even when transparent mode is enabled.
+    last_view_active: bool,
     /// Optional hook to persist per-artifact setting values on edit/reset.
     on_setting_change: Option<SettingChangeHook>,
     /// Optional hook to fetch persisted setting overrides when an artifact becomes
@@ -369,6 +398,10 @@ impl VizApp {
             on_artifact_change: None,
             on_collapse_change: None,
             on_window_change: None,
+            on_window_mode_change: None,
+            window_mode: WindowMode::default(),
+            modifiers: ModifiersState::empty(),
+            last_view_active: false,
             on_setting_change: None,
             on_setting_restore: None,
             rebuild_library: None,
@@ -429,6 +462,22 @@ impl VizApp {
     #[must_use]
     pub fn on_window_change(mut self, f: impl FnMut(WindowState) + 'static) -> Self {
         self.on_window_change = Some(Box::new(f));
+        self
+    }
+
+    /// Sets the initial [`WindowMode`] (restored from persisted [`AppState`]).
+    #[must_use]
+    pub fn with_window_mode(mut self, mode: WindowMode) -> Self {
+        self.window_mode = mode;
+        self.model.borrow_mut().window_mode = mode;
+        self
+    }
+
+    /// Registers a hook called whenever [`WindowMode`] changes so the host can
+    /// persist the updated flags immediately.
+    #[must_use]
+    pub fn on_window_mode_change(mut self, f: impl FnMut(WindowMode) + 'static) -> Self {
+        self.on_window_mode_change = Some(Box::new(f));
         self
     }
 
@@ -727,6 +776,18 @@ impl VizApp {
         }
     }
 
+    /// Applies live window mode changes to the OS window and persists them.
+    fn set_window_mode(&mut self, window: &Window, mode: WindowMode) {
+        if self.window_mode == mode {
+            return;
+        }
+        self.window_mode = mode;
+        apply_window_mode(window, mode);
+        if let Some(hook) = self.on_window_mode_change.as_mut() {
+            hook(mode);
+        }
+    }
+
     /// Builds the GPU renderer and attaches the overlay once the surface format is
     /// known (called from the app's `on_ready` hook).
     pub fn attach_gpu(
@@ -837,8 +898,119 @@ fn non_permission_capture_failure(
     }
 }
 
+/// Global window keyboard shortcuts handled directly by [`VizApp`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowShortcut {
+    /// Resize to a quick preset (`Cmd+1..5` on macOS, `Ctrl+1..5` elsewhere).
+    Resize(WindowSizePreset),
+    /// Toggle borderless window mode (`Cmd+W` on macOS, `Ctrl+W` elsewhere).
+    ToggleBorderless,
+    /// Toggle transparent window background (`Cmd+T` on macOS, `Ctrl+T` elsewhere).
+    ToggleTransparent,
+}
+
+/// Maps a pressed key + modifier state to a [`WindowShortcut`], if any.
+///
+/// Pure function so shortcut bindings are unit-tested without a real OS window.
+/// Requires the platform primary command modifier (`Super`/Cmd on macOS, `Control`
+/// elsewhere) with no extra modifiers (`Shift`, `Alt`, or the other command key).
+fn match_window_shortcut(
+    physical: PhysicalKey,
+    logical: &Key,
+    mods: ModifiersState,
+) -> Option<WindowShortcut> {
+    let primary = if cfg!(target_os = "macos") {
+        mods.super_key() && !mods.control_key()
+    } else {
+        mods.control_key() && !mods.super_key()
+    };
+    if !primary || mods.alt_key() || mods.shift_key() {
+        return None;
+    }
+
+    match physical {
+        PhysicalKey::Code(KeyCode::Digit1) => {
+            return Some(WindowShortcut::Resize(WindowSizePreset::X1));
+        }
+        PhysicalKey::Code(KeyCode::Digit2) => {
+            return Some(WindowShortcut::Resize(WindowSizePreset::X1_5));
+        }
+        PhysicalKey::Code(KeyCode::Digit3) => {
+            return Some(WindowShortcut::Resize(WindowSizePreset::X2));
+        }
+        PhysicalKey::Code(KeyCode::Digit4) => {
+            return Some(WindowShortcut::Resize(WindowSizePreset::X4));
+        }
+        PhysicalKey::Code(KeyCode::Digit5) => {
+            return Some(WindowShortcut::Resize(WindowSizePreset::Max));
+        }
+        PhysicalKey::Code(KeyCode::KeyW) => {
+            return Some(WindowShortcut::ToggleBorderless);
+        }
+        PhysicalKey::Code(KeyCode::KeyT) => {
+            return Some(WindowShortcut::ToggleTransparent);
+        }
+        _ => {}
+    }
+
+    match logical.as_ref() {
+        Key::Character("1") => Some(WindowShortcut::Resize(WindowSizePreset::X1)),
+        Key::Character("2") => Some(WindowShortcut::Resize(WindowSizePreset::X1_5)),
+        Key::Character("3") => Some(WindowShortcut::Resize(WindowSizePreset::X2)),
+        Key::Character("4") => Some(WindowShortcut::Resize(WindowSizePreset::X4)),
+        Key::Character("5") => Some(WindowShortcut::Resize(WindowSizePreset::Max)),
+        Key::Character("w") | Key::Character("W") => Some(WindowShortcut::ToggleBorderless),
+        Key::Character("t") | Key::Character("T") => Some(WindowShortcut::ToggleTransparent),
+        _ => None,
+    }
+}
+
 impl RenderCallback for VizApp {
     fn on_window_event(&mut self, window: &Window, event: &WindowEvent) -> bool {
+        // Track keyboard modifiers for window shortcuts (`Cmd+1..5`, `Cmd+W`, `Cmd+T`).
+        match event {
+            WindowEvent::ModifiersChanged(mods) => {
+                self.modifiers = mods.state();
+            }
+            WindowEvent::Focused(false) => {
+                self.modifiers = ModifiersState::empty();
+            }
+            WindowEvent::KeyboardInput {
+                event: key_ev,
+                is_synthetic: false,
+                ..
+            } if key_ev.state == ElementState::Pressed && !key_ev.repeat => {
+                if let Some(shortcut) =
+                    match_window_shortcut(key_ev.physical_key, &key_ev.logical_key, self.modifiers)
+                {
+                    match shortcut {
+                        WindowShortcut::Resize(preset) => {
+                            apply_window_size_preset(window, preset, self.window_mode.borderless);
+                            if let (Some(hook), Some(state)) = (
+                                self.on_window_change.as_mut(),
+                                Self::current_window_state(window),
+                            ) {
+                                hook(state);
+                            }
+                            self.last_window_save = None;
+                        }
+                        WindowShortcut::ToggleBorderless => {
+                            let mut next = self.window_mode;
+                            next.borderless = !next.borderless;
+                            self.set_window_mode(window, next);
+                        }
+                        WindowShortcut::ToggleTransparent => {
+                            let mut next = self.window_mode;
+                            next.transparent = !next.transparent;
+                            self.set_window_mode(window, next);
+                        }
+                    }
+                    return true;
+                }
+            }
+            _ => {}
+        }
+
         // Any pointer movement resets the overlay auto-hide timer. We flag
         // it here and stamp it against the render clock in `render`, keeping all
         // timing on a single clock. `CursorEntered` also counts so the overlay
@@ -879,9 +1051,33 @@ impl RenderCallback for VizApp {
 
         // Renderer target resizing needs the wgpu device, which is only available
         // in `render`; it reconciles the renderer size against `frame.config` every
-        // frame, so a `Resized` event needs no special handling here. We just
-        // forward input to the egui overlay.
+        // frame, so a `Resized` event needs no special handling here.
+        //
+        // In borderless mode, left-clicking the empty canvas (outside the overlay)
+        // starts a native OS window drag. Check hit-testing BEFORE forwarding the
+        // press to egui: on macOS `window.drag_window()` enters a blocking AppKit
+        // drag loop that swallows `mouseUp:`, so forwarding `Pressed` to egui first
+        // would leave `pointer.any_down() == true` permanently stuck.
+        if self.window_mode.borderless
+            && matches!(
+                event,
+                WindowEvent::MouseInput {
+                    state: ElementState::Pressed,
+                    button: MouseButton::Left,
+                    ..
+                }
+            )
+            && !self.overlay.pointer_over_overlay()
+        {
+            let _ = window.drag_window();
+            return false;
+        }
+
         self.overlay.on_window_event(window, event)
+    }
+
+    fn wants_transparent_clear(&self) -> bool {
+        self.window_mode.transparent && self.last_view_active
     }
 
     fn render(&mut self, frame: &mut FrameContext<'_>) {
@@ -899,6 +1095,7 @@ impl RenderCallback for VizApp {
             permission,
             AUDIO_PERMISSION_APPLIES,
         );
+        self.last_view_active = matches!(view, AppView::Active);
 
         let aspect = if frame.config.height > 0 {
             frame.config.width as f32 / frame.config.height as f32
@@ -928,7 +1125,8 @@ impl RenderCallback for VizApp {
                     tracing::warn!("viz-app: rendering idle clear (degrade paused)");
                     self.logged_paused = true;
                 }
-                let scene = rt.idle_scene();
+                let mut scene = rt.idle_scene();
+                scene.params.transparent_bg = self.window_mode.transparent;
                 renderer.render(
                     frame.device,
                     frame.queue,
@@ -944,6 +1142,7 @@ impl RenderCallback for VizApp {
                 if shed_feedback {
                     scene.params.feedback_decay = None;
                 }
+                scene.params.transparent_bg = self.window_mode.transparent;
                 renderer.render(
                     frame.device,
                     frame.queue,
@@ -980,12 +1179,25 @@ impl RenderCallback for VizApp {
             .last_pointer_move
             .map(|t| render_now.saturating_duration_since(t))
             .unwrap_or(Duration::ZERO);
-        // The overlay is interactive: while egui reports the pointer over a panel we
+        // The overlay is interactive: while the pointer is over a visible panel we
         // keep it shown so a dropdown/settings interaction is never yanked away.
-        let pointer_over_overlay = self.overlay.wants_pointer();
+        let pointer_over_overlay = self.overlay.pointer_over_overlay();
         let vis = decide_visibility(since_move, pointer_over_overlay, self.collapsed);
 
         // Update the overlay model, then paint the egui overlay on top.
+        let inner_logical: winit::dpi::LogicalSize<f64> = frame
+            .window
+            .inner_size()
+            .to_logical(frame.window.scale_factor());
+        let monitor_logical = frame.window.current_monitor().map(|mon| {
+            let sz: winit::dpi::LogicalSize<f64> = mon.size().to_logical(mon.scale_factor());
+            (sz.width, sz.height)
+        });
+        let active_size_preset = detect_size_preset(
+            (inner_logical.width, inner_logical.height),
+            frame.window.is_maximized(),
+            monitor_logical,
+        );
         {
             let mut model = self.model.borrow_mut();
             model.view = ViewSnapshot::from(&view);
@@ -999,6 +1211,8 @@ impl RenderCallback for VizApp {
             // the render loop must not allocate in steady state.
             model.collapsed = vis.collapsed;
             model.show_overlay = vis.show;
+            model.window_mode = self.window_mode;
+            model.active_size_preset = active_size_preset;
             model.request = OverlayRequest::default();
             #[cfg(feature = "perf-hud")]
             {
@@ -1029,6 +1243,21 @@ impl RenderCallback for VizApp {
             }
             if let Some(collapsed) = req.set_collapsed {
                 self.set_collapsed(collapsed);
+            }
+            if let Some(mode) = req.set_window_mode {
+                self.set_window_mode(frame.window, mode);
+            }
+            if let Some(preset) = req.set_size_preset {
+                apply_window_size_preset(frame.window, preset, self.window_mode.borderless);
+                // Persist immediately for synchronous resizes and clear the debounce
+                // timer so any ensuing async `Resized` event also persists cleanly.
+                if let (Some(hook), Some(state)) = (
+                    self.on_window_change.as_mut(),
+                    Self::current_window_state(frame.window),
+                ) {
+                    hook(state);
+                }
+                self.last_window_save = None;
             }
             // Apply setting edits / reset to the runtime. Each edit writes straight
             // into the runtime's setting slot, flushed before the next frame's var
@@ -1066,8 +1295,9 @@ fn render_overlay(ctx: &egui::Context, model: &mut OverlayModel) {
             if !model.show_overlay {
                 return;
             }
-            egui::Area::new(egui::Id::new("viewmusic-overlay"))
+            egui::Area::new(egui::Id::new(OVERLAY_AREA_ID))
                 .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 12.0))
+                .movable(false)
                 .show(ctx, |ui| {
                     egui::Frame::popup(ui.style()).show(ui, |ui| {
                         if model.collapsed {
@@ -1144,9 +1374,18 @@ fn render_overlay(ctx: &egui::Context, model: &mut OverlayModel) {
     }
 }
 
-/// Renders the expanded top-right panel body: header row with the chevron, then the
-/// artifact dropdown. Records any selection / collapse request into `model.request`.
+/// Renders the expanded top-right panel body: header row with the chevron, then a
+/// vertically scrollable body containing the artifact dropdown, auto-generated
+/// settings, and Window controls (so the panel stays usable even at compact `1x`
+/// `320×180` size). Records any user request into `model.request`.
 fn render_panel_body(ui: &mut egui::Ui, model: &mut OverlayModel) {
+    let content_rect = ui.ctx().content_rect();
+    // Cap the panel's layout width so `right_to_left` header alignment and
+    // `ScrollArea::auto_shrink([false, true])` stay compact instead of expanding
+    // to egui's 600px default area size, and always fit inside a `1x` (320×180) window.
+    let panel_width = (content_rect.width() - 36.0).clamp(180.0, 270.0);
+    ui.set_max_width(panel_width);
+
     ui.horizontal(|ui| {
         ui.strong("ViewMusic");
         // Push the chevron to the right edge of the header row.
@@ -1161,72 +1400,118 @@ fn render_panel_body(ui: &mut egui::Ui, model: &mut OverlayModel) {
         });
     });
 
-    if model.entries.is_empty() {
-        // Loaded library is empty: mirror the no-artifacts copy in-panel. (The
-        // Active view normally implies a runtime, but stay robust.) Still offer the
-        // reload action so a user who has just dropped a file in can re-scan.
-        ui.label(NO_ARTIFACTS_MESSAGE);
-        if ui
-            .button("Reload artifacts")
-            .on_hover_text("Re-scan the artifacts folder")
-            .clicked()
-        {
-            model.request.reload_artifacts = true;
-        }
-        return;
-    }
+    let max_body_height = (content_rect.height() - 60.0).max(80.0);
+    egui::ScrollArea::vertical()
+        .id_salt("overlay-panel-scroll")
+        .min_scrolled_height(max_body_height)
+        .max_height(max_body_height)
+        .auto_shrink([false, true])
+        .scroll_source(egui::scroll_area::ScrollSource {
+            scroll_bar: true,
+            drag: false,
+            mouse_wheel: true,
+        })
+        .show(ui, |ui| {
+            if model.entries.is_empty() {
+                // Loaded library is empty: mirror the no-artifacts copy in-panel. (The
+                // Active view normally implies a runtime, but stay robust.) Still offer
+                // the reload action so a user who has just dropped a file in can re-scan.
+                ui.label(NO_ARTIFACTS_MESSAGE);
+                if ui
+                    .button("Reload artifacts")
+                    .on_hover_text("Re-scan the artifacts folder")
+                    .clicked()
+                {
+                    model.request.reload_artifacts = true;
+                }
+                return;
+            }
 
-    // The current selection's display name (falls back to the id, then a prompt).
-    let selected_label = model
-        .active_id
-        .as_ref()
-        .and_then(|id| model.entries.iter().find(|e| &e.id == id))
-        .map(|e| e.name.clone())
-        .unwrap_or_else(|| "Select artifact".to_owned());
+            // The current selection's display name (falls back to the id, then a prompt).
+            let selected_label = model
+                .active_id
+                .as_ref()
+                .and_then(|id| model.entries.iter().find(|e| &e.id == id))
+                .map(|e| e.name.clone())
+                .unwrap_or_else(|| "Select artifact".to_owned());
 
-    ui.horizontal(|ui| {
-        egui::ComboBox::from_id_salt("artifact-dropdown")
-            .selected_text(selected_label)
-            .show_ui(ui, |ui| {
-                for entry in &model.entries {
-                    let is_active = model.active_id.as_ref() == Some(&entry.id);
-                    // `selectable_label` returns a click response; on click we
-                    // *request* the switch — VizApp applies it after the egui pass.
-                    if ui.selectable_label(is_active, &entry.name).clicked() && !is_active {
-                        model.request.select = Some(entry.id.clone());
-                    }
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_id_salt("artifact-dropdown")
+                    .selected_text(selected_label)
+                    .show_ui(ui, |ui| {
+                        for entry in &model.entries {
+                            let is_active = model.active_id.as_ref() == Some(&entry.id);
+                            // `selectable_label` returns a click response; on click we
+                            // *request* the switch — VizApp applies it after the egui pass.
+                            if ui.selectable_label(is_active, &entry.name).clicked() && !is_active {
+                                model.request.select = Some(entry.id.clone());
+                            }
+                        }
+                    });
+
+                // "Reload artifacts" re-scans built-ins + the user folder from scratch.
+                // VizApp applies it after the egui pass (it rebuilds the library).
+                if ui
+                    .button("\u{21bb}") // ↻ refresh glyph
+                    .on_hover_text("Reload artifacts (re-scan the artifacts folder)")
+                    .clicked()
+                {
+                    model.request.reload_artifacts = true;
                 }
             });
 
-        // "Reload artifacts" re-scans built-ins + the user folder from scratch.
-        // VizApp applies it after the egui pass (it rebuilds the library).
-        if ui
-            .button("\u{21bb}") // ↻ refresh glyph
-            .on_hover_text("Reload artifacts (re-scan the artifacts folder)")
-            .clicked()
-        {
-            model.request.reload_artifacts = true;
-        }
-    });
+            // The auto-generated settings panel below the dropdown. Split the
+            // model borrow: the panel owns its working values; we collect borrowed
+            // changes into a local scratch (no allocation when there are no edits —
+            // the common case), then translate to owned `SettingEdit`s the host
+            // applies after the pass.
+            let OverlayModel {
+                settings, request, ..
+            } = model;
+            let mut changes: Vec<SettingChange> = Vec::new();
+            let reset = settings.ui(ui, &mut changes);
+            for change in &changes {
+                request.setting_edits.push(SettingEdit {
+                    name: change.name.to_owned(),
+                    value: change.value,
+                });
+            }
+            if reset {
+                request.reset_settings = true;
+            }
 
-    // The auto-generated settings panel below the dropdown. Split the
-    // model borrow: the panel owns its working values; we collect borrowed changes
-    // into a local scratch (no allocation when there are no edits — the common
-    // case), then translate to owned `SettingEdit`s the host applies after the pass.
-    let OverlayModel {
-        settings, request, ..
-    } = model;
-    let mut changes: Vec<SettingChange> = Vec::new();
-    let reset = settings.ui(ui, &mut changes);
-    for change in &changes {
-        request.setting_edits.push(SettingEdit {
-            name: change.name.to_owned(),
-            value: change.value,
+            // Window presentation mode toggles (live-applied + persisted).
+            ui.separator();
+            ui.label(egui::RichText::new("Window").strong());
+            let mut next_mode = model.window_mode;
+            ui.checkbox(&mut next_mode.borderless, "Borderless")
+                .on_hover_text("Hide titlebar; drag canvas to move — ⌘W");
+            ui.checkbox(&mut next_mode.transparent, "Transparent")
+                .on_hover_text("Show desktop behind the visualizer — ⌘T");
+            ui.checkbox(&mut next_mode.always_on_top, "Always on top")
+                .on_hover_text("Keep window above other windows");
+            if next_mode != model.window_mode {
+                model.window_mode = next_mode;
+                model.request.set_window_mode = Some(next_mode);
+            }
+
+            // Compact one-row window size preset toggle strip.
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.spacing_mut().button_padding = egui::vec2(5.0, 2.0);
+                ui.label("Size");
+                for preset in WindowSizePreset::ALL {
+                    let active = model.active_size_preset == Some(preset);
+                    if ui
+                        .selectable_label(active, preset.label())
+                        .on_hover_text(preset.hover_text())
+                        .clicked()
+                    {
+                        model.request.set_size_preset = Some(preset);
+                    }
+                }
+            });
         });
-    }
-    if reset {
-        request.reset_settings = true;
-    }
 }
 
 /// Renders a screen-centered message block (used for the no-artifacts and
@@ -1336,6 +1621,440 @@ mod tests {
         // No handle and not start_failed (shouldn't happen, but pin it): None.
         assert_eq!(
             non_permission_capture_failure(false, CaptureState::Active, false, true),
+            None
+        );
+    }
+
+    #[test]
+    fn transparent_clear_requires_both_transparent_mode_and_active_view() {
+        let mut app =
+            VizApp::new(ArtifactLibrary::new(), None, false, None).with_window_mode(WindowMode {
+                borderless: true,
+                transparent: true,
+                always_on_top: true,
+            });
+        // Before an Active frame has rendered (e.g. guidance screen), clear stays opaque.
+        assert!(!app.wants_transparent_clear());
+        // Once Active, transparent clear is enabled.
+        app.last_view_active = true;
+        assert!(app.wants_transparent_clear());
+        // Disabling transparent mode restores opaque clear even while Active.
+        app.window_mode.transparent = false;
+        assert!(!app.wants_transparent_clear());
+    }
+
+    #[test]
+    fn overlay_request_is_empty_tracks_size_preset() {
+        let mut req = OverlayRequest::default();
+        assert!(req.is_empty());
+        req.set_size_preset = Some(WindowSizePreset::X1);
+        assert!(!req.is_empty());
+    }
+
+    #[test]
+    fn overlay_panel_stays_compact_at_4x_and_bounded_at_1x() {
+        let lib = ArtifactLibrary::load_builtins([(
+            "spectrum-bars",
+            include_str!("../../../assets/builtin-artifacts/spectrum-bars.artifact.json"),
+        )]);
+        let loaded = lib
+            .get(&ArtifactId("spectrum-bars".to_owned()))
+            .expect("built-in spectrum-bars loads");
+
+        let mut model = OverlayModel {
+            view: ViewSnapshot::Active,
+            active_id: Some(loaded.id.clone()),
+            entries: vec![DropdownEntry {
+                id: loaded.id.clone(),
+                name: loaded.artifact.meta.name.clone(),
+            }],
+            collapsed: false,
+            show_overlay: true,
+            active_size_preset: Some(WindowSizePreset::X4),
+            ..OverlayModel::default()
+        };
+        model.settings.rebind(loaded, |_| None);
+
+        let ctx = egui::Context::default();
+        let run_frames = |width: f32, height: f32, model: &mut OverlayModel| {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, height),
+                )),
+                ..Default::default()
+            };
+            let mut area_rect = egui::Rect::NOTHING;
+            for _ in 0..3 {
+                let _ = ctx.run_ui(raw.clone(), |root| {
+                    render_overlay(root.ctx(), model);
+                });
+                area_rect = ctx
+                    .memory(|mem| mem.area_rect(egui::Id::new("viewmusic-overlay")))
+                    .unwrap_or(egui::Rect::NOTHING);
+            }
+            area_rect
+        };
+
+        let rect_4x = run_frames(1280.0, 720.0, &mut model);
+        assert!(
+            rect_4x.width() > 180.0 && rect_4x.width() < 340.0,
+            "panel width at 1280x720 should stay compact, got {rect_4x:?}"
+        );
+        assert!(
+            rect_4x.height() > 180.0 && rect_4x.height() <= 720.0,
+            "panel height at 1280x720 should fit full settings + Window section, got {rect_4x:?}"
+        );
+
+        let rect_1x = run_frames(320.0, 180.0, &mut model);
+        assert!(
+            rect_1x.width() <= 320.0,
+            "panel width at 320x180 must fit inside 1x window, got {rect_1x:?}"
+        );
+        assert!(
+            rect_1x.height() <= 180.0,
+            "panel height at 320x180 must fit inside 1x window via ScrollArea, got {rect_1x:?}"
+        );
+        assert!(
+            rect_1x.min.x >= 0.0 && rect_1x.max.x <= 320.0 && rect_1x.max.y <= 180.0,
+            "panel rect at 320x180 must stay inside viewport, got {rect_1x:?}"
+        );
+    }
+
+    fn spectrum_bars_model() -> OverlayModel {
+        let lib = ArtifactLibrary::load_builtins([(
+            "spectrum-bars",
+            include_str!("../../../assets/builtin-artifacts/spectrum-bars.artifact.json"),
+        )]);
+        let loaded = lib
+            .get(&ArtifactId("spectrum-bars".to_owned()))
+            .expect("built-in spectrum-bars loads");
+
+        let mut model = OverlayModel {
+            view: ViewSnapshot::Active,
+            active_id: Some(loaded.id.clone()),
+            entries: vec![DropdownEntry {
+                id: loaded.id.clone(),
+                name: loaded.artifact.meta.name.clone(),
+            }],
+            collapsed: false,
+            show_overlay: true,
+            active_size_preset: Some(WindowSizePreset::X4),
+            ..OverlayModel::default()
+        };
+        model.settings.rebind(loaded, |_| None);
+        model
+    }
+
+    fn find_text_rect_in_shapes(
+        shapes: &[egui::epaint::ClippedShape],
+        needle: &str,
+    ) -> Option<egui::Rect> {
+        fn walk(shape: &egui::Shape, needle: &str) -> Option<egui::Rect> {
+            match shape {
+                egui::Shape::Text(text) => {
+                    if text.galley.text() == needle {
+                        Some(egui::Rect::from_min_size(text.pos, text.galley.size()))
+                    } else {
+                        None
+                    }
+                }
+                egui::Shape::Vec(children) => children.iter().find_map(|s| walk(s, needle)),
+                _ => None,
+            }
+        }
+        shapes.iter().find_map(|cs| walk(&cs.shape, needle))
+    }
+
+    #[test]
+    fn overlay_panel_expands_back_after_1x_to_4x() {
+        let mut model = spectrum_bars_model();
+        let ctx = egui::Context::default();
+        let run_frames = |width: f32, height: f32, model: &mut OverlayModel| {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, height),
+                )),
+                ..Default::default()
+            };
+            let mut area_rect = egui::Rect::NOTHING;
+            for _ in 0..4 {
+                let _ = ctx.run_ui(raw.clone(), |root| {
+                    render_overlay(root.ctx(), model);
+                });
+                area_rect = ctx
+                    .memory(|mem| mem.area_rect(egui::Id::new(OVERLAY_AREA_ID)))
+                    .unwrap_or(egui::Rect::NOTHING);
+            }
+            area_rect
+        };
+
+        let initial_4x = run_frames(1280.0, 720.0, &mut model);
+        assert!(
+            initial_4x.height() > 220.0,
+            "initial 4x panel should render full height, got {initial_4x:?}"
+        );
+
+        let shrunk_1x = run_frames(320.0, 180.0, &mut model);
+        assert!(
+            shrunk_1x.height() <= 180.0,
+            "1x panel must shrink to fit inside 180px viewport, got {shrunk_1x:?}"
+        );
+
+        let restored_4x = run_frames(1280.0, 720.0, &mut model);
+        assert!(
+            (restored_4x.height() - initial_4x.height()).abs() <= 2.0,
+            "panel must expand back to full 4x height after 1x→4x: initial={initial_4x:?}, restored={restored_4x:?}"
+        );
+    }
+
+    #[test]
+    fn overlay_slider_drag_and_release_updates_and_does_not_stick() {
+        let mut model = spectrum_bars_model();
+        let ctx = egui::Context::default();
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0));
+
+        let step = |time: f64, events: Vec<egui::Event>, model: &mut OverlayModel| {
+            model.request = OverlayRequest::default();
+            let raw = egui::RawInput {
+                screen_rect: Some(screen_rect),
+                time: Some(time),
+                events,
+                ..Default::default()
+            };
+            ctx.run_ui(raw, |root| {
+                render_overlay(root.ctx(), model);
+            })
+        };
+
+        // Warm up layout so area and widget rects settle.
+        let mut out = step(0.0, vec![], &mut model);
+        for i in 1..=3 {
+            out = step(i as f64 * 0.016, vec![], &mut model);
+        }
+
+        let area_rect = ctx
+            .memory(|mem| mem.area_rect(egui::Id::new(OVERLAY_AREA_ID)))
+            .expect("overlay area rect exists");
+        let bars_label_rect =
+            find_text_rect_in_shapes(&out.shapes, "Bars").expect("Bars slider label rendered");
+        let borderless_label_rect = find_text_rect_in_shapes(&out.shapes, "Borderless")
+            .expect("Borderless checkbox label rendered");
+
+        // The slider rail lies to the left of the DragValue + "Bars" label on the same row.
+        let slider_y = bars_label_rect.center().y;
+        let slider_start = egui::pos2(area_rect.min.x + 60.0, slider_y);
+        let slider_end = egui::pos2(area_rect.min.x + 110.0, slider_y);
+
+        // Move onto the slider rail, press, drag horizontally, and release.
+        let _ = step(
+            0.10,
+            vec![egui::Event::PointerMoved(slider_start)],
+            &mut model,
+        );
+        let _ = step(
+            0.12,
+            vec![egui::Event::PointerButton {
+                pos: slider_start,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            &mut model,
+        );
+        let _ = step(
+            0.14,
+            vec![egui::Event::PointerMoved(slider_end)],
+            &mut model,
+        );
+        let edited_during_drag = model.request.setting_edits.clone();
+        let _ = step(
+            0.16,
+            vec![egui::Event::PointerButton {
+                pos: slider_end,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            &mut model,
+        );
+        let edited_on_release = model.request.setting_edits.clone();
+        // Run one settled frame after release.
+        let _ = step(0.18, vec![], &mut model);
+
+        let all_edits: Vec<_> = edited_during_drag
+            .into_iter()
+            .chain(edited_on_release)
+            .collect();
+        let bars_edit = all_edits
+            .iter()
+            .rev()
+            .find(|edit| edit.name == "bars")
+            .expect("dragging Bars slider must emit a `bars` setting edit");
+        assert_ne!(
+            bars_edit.value,
+            SettingValue::Scalar(48.0),
+            "dragging Bars slider must change `bars` from its default 48"
+        );
+        assert!(
+            !ctx.egui_is_using_pointer(),
+            "pointer must not remain stuck after releasing the slider"
+        );
+
+        // A subsequent click on the Borderless checkbox must register cleanly.
+        let checkbox_pos = borderless_label_rect.center();
+        let _ = step(
+            0.22,
+            vec![egui::Event::PointerMoved(checkbox_pos)],
+            &mut model,
+        );
+        let _ = step(
+            0.24,
+            vec![egui::Event::PointerButton {
+                pos: checkbox_pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            &mut model,
+        );
+        let _ = step(
+            0.26,
+            vec![egui::Event::PointerButton {
+                pos: checkbox_pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            &mut model,
+        );
+        assert_eq!(
+            model.request.set_window_mode,
+            Some(WindowMode {
+                borderless: true,
+                transparent: false,
+                always_on_top: false,
+            }),
+            "subsequent checkbox click must register cleanly after slider drag"
+        );
+    }
+
+    #[test]
+    fn overlay_pointer_over_overlay_tracks_live_cursor_inside_and_outside() {
+        let model = Rc::new(RefCell::new(spectrum_bars_model()));
+        let mut overlay = Overlay::new();
+        let ui_model = model.clone();
+        overlay.set_ui(move |ctx| render_overlay(ctx, &mut ui_model.borrow_mut()));
+
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0));
+        let raw = egui::RawInput {
+            screen_rect: Some(screen_rect),
+            ..Default::default()
+        };
+        for _ in 0..3 {
+            overlay.run_ui_for_test(raw.clone());
+        }
+
+        let area_rect = overlay
+            .ctx()
+            .memory(|mem| mem.area_rect(egui::Id::new(OVERLAY_AREA_ID)))
+            .expect("overlay area rect exists");
+
+        // No cursor position yet and egui does not want pointer -> false.
+        assert!(!overlay.pointer_over_overlay());
+
+        // Live cursor over empty canvas far from overlay -> false.
+        overlay.set_cursor_pos_for_test(Some(egui::pos2(40.0, 40.0)));
+        assert!(!overlay.pointer_over_overlay());
+
+        // Live cursor inside overlay (even before next egui pass!) -> true.
+        overlay.set_cursor_pos_for_test(Some(area_rect.center()));
+        assert!(overlay.pointer_over_overlay());
+
+        // Live cursor just outside the panel edge within the 4pt margin -> true.
+        overlay.set_cursor_pos_for_test(Some(egui::pos2(
+            area_rect.min.x - 2.0,
+            area_rect.center().y,
+        )));
+        assert!(overlay.pointer_over_overlay());
+
+        // Live cursor outside the margin -> false.
+        overlay.set_cursor_pos_for_test(Some(egui::pos2(
+            area_rect.min.x - 10.0,
+            area_rect.center().y,
+        )));
+        assert!(!overlay.pointer_over_overlay());
+
+        // Auto-hidden overlay: even if cursor is over the old area rect, returns false
+        // so borderless canvas dragging works anywhere when the panel is hidden.
+        model.borrow_mut().show_overlay = false;
+        overlay.run_ui_for_test(raw);
+        overlay.set_cursor_pos_for_test(Some(area_rect.center()));
+        assert!(!overlay.pointer_over_overlay());
+    }
+
+    #[test]
+    fn match_window_shortcut_bindings() {
+        let primary = if cfg!(target_os = "macos") {
+            ModifiersState::SUPER
+        } else {
+            ModifiersState::CONTROL
+        };
+        let empty_key = Key::Unidentified(winit::keyboard::NativeKey::Unidentified);
+
+        assert_eq!(
+            match_window_shortcut(PhysicalKey::Code(KeyCode::Digit1), &empty_key, primary),
+            Some(WindowShortcut::Resize(WindowSizePreset::X1))
+        );
+        assert_eq!(
+            match_window_shortcut(PhysicalKey::Code(KeyCode::Digit2), &empty_key, primary),
+            Some(WindowShortcut::Resize(WindowSizePreset::X1_5))
+        );
+        assert_eq!(
+            match_window_shortcut(PhysicalKey::Code(KeyCode::Digit3), &empty_key, primary),
+            Some(WindowShortcut::Resize(WindowSizePreset::X2))
+        );
+        assert_eq!(
+            match_window_shortcut(PhysicalKey::Code(KeyCode::Digit4), &empty_key, primary),
+            Some(WindowShortcut::Resize(WindowSizePreset::X4))
+        );
+        assert_eq!(
+            match_window_shortcut(PhysicalKey::Code(KeyCode::Digit5), &empty_key, primary),
+            Some(WindowShortcut::Resize(WindowSizePreset::Max))
+        );
+        assert_eq!(
+            match_window_shortcut(PhysicalKey::Code(KeyCode::KeyW), &empty_key, primary),
+            Some(WindowShortcut::ToggleBorderless)
+        );
+        assert_eq!(
+            match_window_shortcut(PhysicalKey::Code(KeyCode::KeyT), &empty_key, primary),
+            Some(WindowShortcut::ToggleTransparent)
+        );
+
+        // Without modifier or with extra Shift/Alt -> ignored.
+        assert_eq!(
+            match_window_shortcut(
+                PhysicalKey::Code(KeyCode::Digit1),
+                &empty_key,
+                ModifiersState::empty()
+            ),
+            None
+        );
+        assert_eq!(
+            match_window_shortcut(
+                PhysicalKey::Code(KeyCode::KeyW),
+                &empty_key,
+                primary | ModifiersState::SHIFT
+            ),
+            None
+        );
+        assert_eq!(
+            match_window_shortcut(
+                PhysicalKey::Code(KeyCode::KeyT),
+                &empty_key,
+                primary | ModifiersState::ALT
+            ),
             None
         );
     }

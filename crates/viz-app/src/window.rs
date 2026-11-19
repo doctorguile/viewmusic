@@ -27,7 +27,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
-use winit::window::{Window, WindowId};
+use winit::window::{Window, WindowId, WindowLevel};
 
 /// Hard 60 Hz frame budget. Presents closer together than this are skipped so the
 /// effective update rate stays at 60 even on 120 Hz displays.
@@ -39,6 +39,17 @@ pub const MIN_FRAME_INTERVAL: Duration = Duration::from_micros(15_500);
 /// Initial logical window size (physical size is derived via the scale factor).
 const INITIAL_WIDTH: u32 = 1280;
 const INITIAL_HEIGHT: u32 = 720;
+
+/// Base `1x` logical window size (16:9 compact floating widget).
+const PRESET_1X_WIDTH: u32 = 320;
+const PRESET_1X_HEIGHT: u32 = 180;
+
+/// Logical pixel tolerance when matching the current window size against a fixed preset.
+const SIZE_PRESET_TOLERANCE: f64 = 4.0;
+
+/// Logical pixel tolerance when matching the current window size against the monitor size
+/// (covers borderless full-display maximize).
+const MAX_MONITOR_TOLERANCE: f64 = 8.0;
 
 /// Live GPU resources shared with the render path.
 ///
@@ -108,6 +119,20 @@ impl GpuContext {
         config.present_mode = wgpu::PresentMode::Fifo;
         config.desired_maximum_frame_latency = 1;
         config.usage = wgpu::TextureUsages::RENDER_ATTACHMENT;
+        // Prefer premultiplied alpha so transparent window mode composites cleanly
+        // (Metal supports PreMultiplied and viz-render shaders emit premultiplied RGBA).
+        let caps = surface.get_capabilities(&adapter);
+        if caps
+            .alpha_modes
+            .contains(&wgpu::CompositeAlphaMode::PreMultiplied)
+        {
+            config.alpha_mode = wgpu::CompositeAlphaMode::PreMultiplied;
+        } else if caps
+            .alpha_modes
+            .contains(&wgpu::CompositeAlphaMode::PostMultiplied)
+        {
+            config.alpha_mode = wgpu::CompositeAlphaMode::PostMultiplied;
+        }
         let format = config.format;
 
         surface.configure(&device, &config);
@@ -172,6 +197,181 @@ pub trait RenderCallback {
     fn on_window_event(&mut self, _window: &Window, _event: &WindowEvent) -> bool {
         false
     }
+
+    /// Whether the shell's initial clear pass should clear to transparent
+    /// (`wgpu::Color::TRANSPARENT`) instead of the opaque dark background.
+    fn wants_transparent_clear(&self) -> bool {
+        false
+    }
+}
+
+/// Live-toggleable window presentation flags.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WindowMode {
+    /// Hide window chrome (titlebar / borders); drag canvas to move.
+    pub borderless: bool,
+    /// Render the active visualizer over a transparent background.
+    pub transparent: bool,
+    /// Keep the window floating above normal windows.
+    pub always_on_top: bool,
+}
+
+/// Applies live-toggleable [`WindowMode`] properties to an existing window.
+pub fn apply_window_mode(window: &Window, mode: WindowMode) {
+    window.set_decorations(!mode.borderless);
+    window.set_window_level(if mode.always_on_top {
+        WindowLevel::AlwaysOnTop
+    } else {
+        WindowLevel::Normal
+    });
+    #[cfg(target_os = "macos")]
+    {
+        use winit::platform::macos::WindowExtMacOS;
+        window.set_has_shadow(!mode.transparent);
+    }
+}
+
+/// Quick window-size presets exposed in the top-right overlay panel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowSizePreset {
+    /// Compact 16:9 floating widget (`320 × 180` logical px).
+    X1,
+    /// 1.5× scale (`480 × 270` logical px).
+    X1_5,
+    /// 2× scale (`640 × 360` logical px).
+    X2,
+    /// 4× scale (`1280 × 720` logical px, matching the default launch size).
+    X4,
+    /// Fill the current display.
+    Max,
+}
+
+impl WindowSizePreset {
+    /// All presets in UI display order.
+    pub const ALL: [WindowSizePreset; 5] = [Self::X1, Self::X1_5, Self::X2, Self::X4, Self::Max];
+
+    /// Compact button label for the overlay strip.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::X1 => "1x",
+            Self::X1_5 => "1.5x",
+            Self::X2 => "2x",
+            Self::X4 => "4x",
+            Self::Max => "Max",
+        }
+    }
+
+    /// Hover tooltip text (static to avoid per-frame allocation).
+    #[must_use]
+    pub const fn hover_text(self) -> &'static str {
+        match self {
+            Self::X1 => "Resize window to 1x (320×180) — ⌘1",
+            Self::X1_5 => "Resize window to 1.5x (480×270) — ⌘2",
+            Self::X2 => "Resize window to 2x (640×360) — ⌘3",
+            Self::X4 => "Resize window to 4x (1280×720) — ⌘4",
+            Self::Max => "Maximize window to fill display — ⌘5",
+        }
+    }
+
+    /// Target logical `(width, height)` for fixed presets, or `None` for [`Self::Max`].
+    #[must_use]
+    pub const fn logical_size(self) -> Option<(u32, u32)> {
+        match self {
+            Self::X1 => Some((PRESET_1X_WIDTH, PRESET_1X_HEIGHT)),
+            Self::X1_5 => Some((PRESET_1X_WIDTH * 3 / 2, PRESET_1X_HEIGHT * 3 / 2)),
+            Self::X2 => Some((PRESET_1X_WIDTH * 2, PRESET_1X_HEIGHT * 2)),
+            Self::X4 => Some((PRESET_1X_WIDTH * 4, PRESET_1X_HEIGHT * 4)),
+            Self::Max => None,
+        }
+    }
+}
+
+/// Detects which [`WindowSizePreset`] matches the window's current state.
+///
+/// Pure function (no windowing I/O) so it is unit-testable.
+/// - Returns `Some(Max)` if `is_maximized` is true or if `monitor_logical` matches
+///   `inner_logical` within `<= 8.0` logical px on both axes (covering borderless
+///   full-display maximize).
+/// - Otherwise checks `X1`, `X1_5`, `X2`, `X4` within `<= 4.0` logical px on both axes.
+/// - Returns `None` when manually dragged to a custom size.
+#[must_use]
+pub fn detect_size_preset(
+    inner_logical: (f64, f64),
+    is_maximized: bool,
+    monitor_logical: Option<(f64, f64)>,
+) -> Option<WindowSizePreset> {
+    if is_maximized {
+        return Some(WindowSizePreset::Max);
+    }
+    if let Some((mon_w, mon_h)) = monitor_logical {
+        if (inner_logical.0 - mon_w).abs() <= MAX_MONITOR_TOLERANCE
+            && (inner_logical.1 - mon_h).abs() <= MAX_MONITOR_TOLERANCE
+        {
+            return Some(WindowSizePreset::Max);
+        }
+    }
+    for preset in [
+        WindowSizePreset::X1,
+        WindowSizePreset::X1_5,
+        WindowSizePreset::X2,
+        WindowSizePreset::X4,
+    ] {
+        if let Some((w, h)) = preset.logical_size() {
+            if (inner_logical.0 - w as f64).abs() <= SIZE_PRESET_TOLERANCE
+                && (inner_logical.1 - h as f64).abs() <= SIZE_PRESET_TOLERANCE
+            {
+                return Some(preset);
+            }
+        }
+    }
+    None
+}
+
+/// Applies a [`WindowSizePreset`] to an existing window.
+///
+/// Fixed presets un-maximize first, clamp the target logical size to the current
+/// monitor's logical bounds (so `4x` never overflows a small display), and call
+/// [`Window::request_inner_size`]. For [`WindowSizePreset::Max`], borderless windows
+/// explicitly position and size to the current monitor because macOS `NSWindow`
+/// zoom/maximize is a no-op without `NSWindowStyleMaskTitled`.
+pub fn apply_window_size_preset(window: &Window, preset: WindowSizePreset, borderless: bool) {
+    match preset.logical_size() {
+        Some((target_w, target_h)) => {
+            window.set_maximized(false);
+            let mut w = target_w as f64;
+            let mut h = target_h as f64;
+            if let Some(mon) = window.current_monitor() {
+                let mon_logical: winit::dpi::LogicalSize<f64> =
+                    mon.size().to_logical(mon.scale_factor());
+                if mon_logical.width >= 1.0 {
+                    w = w.min(mon_logical.width);
+                }
+                if mon_logical.height >= 1.0 {
+                    h = h.min(mon_logical.height);
+                }
+            }
+            let _ = window.request_inner_size(winit::dpi::LogicalSize::new(w, h));
+        }
+        None => {
+            if borderless {
+                if let Some(mon) = window.current_monitor() {
+                    // Convert to logical points using the *target* monitor's scale
+                    // factor: passing `PhysicalSize` directly causes winit on macOS
+                    // to divide by the window's previous-monitor scale factor,
+                    // doubling dimensions when moving from 1× to a 2× Retina display.
+                    let mon_logical: winit::dpi::LogicalSize<f64> =
+                        mon.size().to_logical(mon.scale_factor());
+                    window.set_outer_position(mon.position());
+                    let _ = window.request_inner_size(mon_logical);
+                } else {
+                    window.set_maximized(true);
+                }
+            } else {
+                window.set_maximized(true);
+            }
+        }
+    }
 }
 
 /// One-shot hook run once the GPU context first exists, so the host can build
@@ -190,6 +390,35 @@ pub struct InitialWindow {
     pub width: u32,
     /// Inner height in physical pixels.
     pub height: u32,
+}
+
+/// Clamps a restored [`InitialWindow`]'s physical dimensions to at least `1×1` and
+/// at most the largest available monitor's physical `(width, height)`.
+///
+/// Pure function so it is unit-testable. Protects against stale or corrupt persisted
+/// state (e.g. a cross-monitor double-scaled `6912×2104` entry) opening an oversized
+/// off-screen window. When `max_monitor_size` is `None`, only enforces the `>= 1` floor.
+#[must_use]
+pub fn clamp_initial_window(
+    win: InitialWindow,
+    max_monitor_size: Option<(u32, u32)>,
+) -> InitialWindow {
+    let mut width = win.width.max(1);
+    let mut height = win.height.max(1);
+    if let Some((max_w, max_h)) = max_monitor_size {
+        if max_w > 0 {
+            width = width.min(max_w);
+        }
+        if max_h > 0 {
+            height = height.min(max_h);
+        }
+    }
+    InitialWindow {
+        x: win.x,
+        y: win.y,
+        width,
+        height,
+    }
 }
 
 /// Decides whether to present this redraw given the hard 60 Hz cap.
@@ -219,6 +448,8 @@ pub struct App<C: RenderCallback> {
     /// Restored geometry to apply when the window is created; `None` ⇒ use
     /// the platform default size + placement.
     initial_window: Option<InitialWindow>,
+    /// Initial window mode (borderless, transparent, always-on-top) applied at creation.
+    window_mode: WindowMode,
 }
 
 impl<C: RenderCallback> App<C> {
@@ -232,6 +463,7 @@ impl<C: RenderCallback> App<C> {
             last_present: None,
             on_ready: None,
             initial_window: None,
+            window_mode: WindowMode::default(),
         }
     }
 
@@ -246,6 +478,13 @@ impl<C: RenderCallback> App<C> {
     /// window opens at the saved position + size instead of the platform default.
     pub fn with_initial_window(mut self, initial: Option<InitialWindow>) -> Self {
         self.initial_window = initial;
+        self
+    }
+
+    /// Sets the initial [`WindowMode`] (borderless, transparent, always-on-top) applied
+    /// when the window is created.
+    pub fn with_window_mode(mut self, mode: WindowMode) -> Self {
+        self.window_mode = mode;
         self
     }
 
@@ -281,8 +520,19 @@ impl<C: RenderCallback> App<C> {
                 label: Some("viewmusic-frame"),
             });
 
-        // Clear pass FIRST — establishes the dark scene. The overlay/visualizer
+        // Clear pass FIRST — establishes the scene background (transparent when the
+        // callback requests it, opaque dark otherwise). The overlay/visualizer
         // callback loads (LoadOp::Load) on top so the scene is never wiped (R2).
+        let clear_color = if self.callback.wants_transparent_clear() {
+            wgpu::Color::TRANSPARENT
+        } else {
+            wgpu::Color {
+                r: 0.02,
+                g: 0.02,
+                b: 0.03,
+                a: 1.0,
+            }
+        };
         {
             let _clear = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("clear-pass"),
@@ -291,12 +541,7 @@ impl<C: RenderCallback> App<C> {
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.02,
-                            g: 0.02,
-                            b: 0.03,
-                            a: 1.0,
-                        }),
+                        load: wgpu::LoadOp::Clear(clear_color),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -335,13 +580,43 @@ impl<C: RenderCallback> ApplicationHandler for App<C> {
             return;
         }
 
-        let mut attrs = Window::default_attributes().with_title("ViewMusic");
-        // Restore persisted geometry (physical px) when available, else the platform
-        // default logical size.
+        let mode = self.window_mode;
+        // Always enable transparent surface support at creation so Transparent mode
+        // can be toggled live at runtime without recreating the window.
+        let mut attrs = Window::default_attributes()
+            .with_title("ViewMusic")
+            .with_transparent(true)
+            .with_decorations(!mode.borderless)
+            .with_resizable(true)
+            .with_window_level(if mode.always_on_top {
+                WindowLevel::AlwaysOnTop
+            } else {
+                WindowLevel::Normal
+            });
+        #[cfg(target_os = "macos")]
+        {
+            use winit::platform::macos::WindowAttributesExtMacOS;
+            attrs = attrs
+                .with_has_shadow(!mode.transparent)
+                .with_accepts_first_mouse(true);
+        }
+        // Restore persisted geometry (physical px) when available, clamped to the
+        // largest available monitor so stale/oversized state never opens off-screen.
+        let max_monitor_size = event_loop
+            .available_monitors()
+            .chain(event_loop.primary_monitor())
+            .map(|m| m.size())
+            .fold(None, |acc: Option<(u32, u32)>, sz| {
+                Some(match acc {
+                    Some((w, h)) => (w.max(sz.width), h.max(sz.height)),
+                    None => (sz.width, sz.height),
+                })
+            });
         match self.initial_window {
             Some(win) => {
+                let win = clamp_initial_window(win, max_monitor_size);
                 attrs = attrs
-                    .with_inner_size(PhysicalSize::new(win.width.max(1), win.height.max(1)))
+                    .with_inner_size(PhysicalSize::new(win.width, win.height))
                     .with_position(winit::dpi::PhysicalPosition::new(win.x, win.y));
             }
             None => {
@@ -469,5 +744,136 @@ mod tests {
             (58..=62).contains(&presents),
             "expected ~60 presents, got {presents}"
         );
+    }
+
+    #[test]
+    fn size_preset_logical_sizes_and_labels() {
+        assert_eq!(WindowSizePreset::X1.logical_size(), Some((320, 180)));
+        assert_eq!(WindowSizePreset::X1_5.logical_size(), Some((480, 270)));
+        assert_eq!(WindowSizePreset::X2.logical_size(), Some((640, 360)));
+        assert_eq!(
+            WindowSizePreset::X4.logical_size(),
+            Some((INITIAL_WIDTH, INITIAL_HEIGHT))
+        );
+        assert_eq!(WindowSizePreset::Max.logical_size(), None);
+
+        let labels: Vec<&str> = WindowSizePreset::ALL.iter().map(|p| p.label()).collect();
+        assert_eq!(labels, vec!["1x", "1.5x", "2x", "4x", "Max"]);
+    }
+
+    #[test]
+    fn detect_size_preset_exact_and_within_tolerance() {
+        let monitor = Some((1920.0, 1080.0));
+        assert_eq!(
+            detect_size_preset((320.0, 180.0), false, monitor),
+            Some(WindowSizePreset::X1)
+        );
+        assert_eq!(
+            detect_size_preset((480.0, 270.0), false, monitor),
+            Some(WindowSizePreset::X1_5)
+        );
+        assert_eq!(
+            detect_size_preset((640.0, 360.0), false, monitor),
+            Some(WindowSizePreset::X2)
+        );
+        assert_eq!(
+            detect_size_preset((1280.0, 720.0), false, monitor),
+            Some(WindowSizePreset::X4)
+        );
+        // Within <= 4.0 logical px tolerance on both axes.
+        assert_eq!(
+            detect_size_preset((324.0, 176.0), false, monitor),
+            Some(WindowSizePreset::X1)
+        );
+        assert_eq!(
+            detect_size_preset((636.5, 363.5), false, monitor),
+            Some(WindowSizePreset::X2)
+        );
+        // Just outside tolerance on one axis → custom size.
+        assert_eq!(detect_size_preset((324.1, 180.0), false, monitor), None);
+        assert_eq!(detect_size_preset((320.0, 184.5), false, monitor), None);
+    }
+
+    #[test]
+    fn detect_size_preset_custom_returns_none() {
+        assert_eq!(
+            detect_size_preset((800.0, 500.0), false, Some((1920.0, 1080.0))),
+            None
+        );
+        assert_eq!(detect_size_preset((800.0, 500.0), false, None), None);
+    }
+
+    #[test]
+    fn detect_size_preset_maximized_and_borderless_monitor_fill() {
+        // Explicit maximized flag always reports Max regardless of inner size.
+        assert_eq!(
+            detect_size_preset((1280.0, 720.0), true, Some((1920.0, 1080.0))),
+            Some(WindowSizePreset::Max)
+        );
+        assert_eq!(
+            detect_size_preset((1000.0, 600.0), true, None),
+            Some(WindowSizePreset::Max)
+        );
+        // Borderless monitor fill (is_maximized == false) within <= 8.0 logical px.
+        assert_eq!(
+            detect_size_preset((1920.0, 1080.0), false, Some((1920.0, 1080.0))),
+            Some(WindowSizePreset::Max)
+        );
+        assert_eq!(
+            detect_size_preset((1912.0, 1072.0), false, Some((1920.0, 1080.0))),
+            Some(WindowSizePreset::Max)
+        );
+        // Outside 8.0 logical px tolerance from monitor size → None.
+        assert_eq!(
+            detect_size_preset((1911.0, 1080.0), false, Some((1920.0, 1080.0))),
+            None
+        );
+    }
+
+    #[test]
+    fn clamp_initial_window_caps_oversized_state_to_monitor_bounds() {
+        // Stale double-scaled 6912×2104 state gets clamped to a 3456×2234 Retina monitor.
+        let oversized = InitialWindow {
+            x: 0,
+            y: 130,
+            width: 6912,
+            height: 2104,
+        };
+        assert_eq!(
+            clamp_initial_window(oversized, Some((3456, 2234))),
+            InitialWindow {
+                x: 0,
+                y: 130,
+                width: 3456,
+                height: 2104,
+            }
+        );
+
+        // Normal size within bounds passes through unchanged.
+        let normal = InitialWindow {
+            x: 100,
+            y: 80,
+            width: 1280,
+            height: 720,
+        };
+        assert_eq!(clamp_initial_window(normal, Some((3456, 2234))), normal);
+
+        // Zero dimensions are floored to 1; missing monitor info keeps valid size.
+        let zero = InitialWindow {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        };
+        assert_eq!(
+            clamp_initial_window(zero, None),
+            InitialWindow {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            }
+        );
+        assert_eq!(clamp_initial_window(normal, None), normal);
     }
 }

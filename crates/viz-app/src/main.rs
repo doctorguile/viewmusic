@@ -30,7 +30,7 @@ use viz_app::logging;
 use viz_app::persist::{ensure_artifacts_dir, should_save_window, AppState, WindowState};
 use viz_app::runtime::SettingValue;
 use viz_app::viz::VizApp;
-use viz_app::window::{App, InitialWindow};
+use viz_app::window::{App, InitialWindow, WindowMode};
 use viz_audio::AudioPipeline;
 use viz_contract::{ArtifactLibrary, LoadedArtifact};
 
@@ -146,6 +146,11 @@ fn main() {
         tracing::info!(target: "viewmusic", id = %id, "resolved active artifact");
     }
     let overlay_collapsed = app_state.overlay_collapsed;
+    let window_mode = WindowMode {
+        borderless: app_state.borderless,
+        transparent: app_state.transparent,
+        always_on_top: app_state.always_on_top,
+    };
 
     // Start system-audio capture. This always runs the full create-tap → aggregate
     // → IOProc → AudioDeviceStart sequence — that *is* what triggers the macOS TCC
@@ -195,6 +200,16 @@ fn main() {
             s.save();
         }
     };
+    let on_window_mode = {
+        let state = state.clone();
+        move |mode: WindowMode| {
+            let mut s = state.borrow_mut();
+            s.borderless = mode.borderless;
+            s.transparent = mode.transparent;
+            s.always_on_top = mode.always_on_top;
+            s.save();
+        }
+    };
     let on_window = |ws: WindowState| ws.save();
 
     // Restore validated per-artifact setting overrides for the active artifact at
@@ -224,8 +239,10 @@ fn main() {
     };
 
     let viz_app = VizApp::new(library, active_id, overlay_collapsed, audio)
+        .with_window_mode(window_mode)
         .on_artifact_change(on_select)
         .on_collapse_change(on_collapse)
+        .on_window_mode_change(on_window_mode)
         .on_window_change(on_window)
         .on_setting_change(on_setting_change)
         .on_setting_restore(on_setting_restore)
@@ -234,6 +251,7 @@ fn main() {
 
     let mut app = App::new(viz_app)
         .with_initial_window(initial_window)
+        .with_window_mode(window_mode)
         .on_ready(|gpu, win, viz_app| {
             viz_app.attach_gpu(&gpu.device, &gpu.queue, win, gpu.format);
         });

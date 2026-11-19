@@ -84,6 +84,12 @@ pub struct AppState {
     /// Whether the top-right overlay panel is collapsed to its chevron. The
     /// auto-hide timer is *not* persisted — only this explicit collapse state.
     pub overlay_collapsed: bool,
+    /// Whether window decorations (titlebar / borders) are hidden.
+    pub borderless: bool,
+    /// Whether the active visualizer renders over a transparent background.
+    pub transparent: bool,
+    /// Whether the window stays above normal windows.
+    pub always_on_top: bool,
 }
 
 /// Persisted window geometry (`window_state.json`).
@@ -526,6 +532,7 @@ mod tests {
             last_artifact_id: Some("bravo".to_owned()),
             setting_values: BTreeMap::new(),
             overlay_collapsed: true,
+            ..AppState::default()
         };
         state
             .setting_values
@@ -536,6 +543,33 @@ mod tests {
         let json = serde_json::to_string(&state).unwrap();
         let back: AppState = serde_json::from_str(&json).unwrap();
         assert_eq!(state, back);
+    }
+
+    #[test]
+    fn app_state_window_mode_defaults_from_old_json_and_roundtrips() {
+        // Legacy app_state.json lacking the window-mode fields must default all 3 to false.
+        let legacy = r#"{"last_artifact_id":"alpha","overlay_collapsed":true}"#;
+        let restored: AppState = serde_json::from_str(legacy).unwrap();
+        assert_eq!(restored.last_artifact_id.as_deref(), Some("alpha"));
+        assert!(restored.overlay_collapsed);
+        assert!(!restored.borderless);
+        assert!(!restored.transparent);
+        assert!(!restored.always_on_top);
+
+        // New JSON with all 3 flags set round-trips cleanly.
+        let state = AppState {
+            last_artifact_id: Some("alpha".to_owned()),
+            borderless: true,
+            transparent: true,
+            always_on_top: true,
+            ..AppState::default()
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let back: AppState = serde_json::from_str(&json).unwrap();
+        assert_eq!(state, back);
+        assert!(back.borderless);
+        assert!(back.transparent);
+        assert!(back.always_on_top);
     }
 
     #[test]

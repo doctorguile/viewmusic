@@ -77,22 +77,28 @@ struct HopOutput {
     beat: Option<BeatEvent>,
 }
 
+/// Precomputed lower frequency edges of all `BAND_COUNT` log-spaced bands
+/// (plus the upper Nyquist edge at index `BAND_COUNT`).
+fn band_edges() -> [f64; BAND_COUNT + 1] {
+    let ratio = BAND_HI_HZ / BAND_LO_HZ;
+    // edges[k] = lower frequency of band k; band k spans [edges[k], edges[k+1]).
+    let mut edges = [0.0f64; BAND_COUNT + 1];
+    for (k, slot) in edges.iter_mut().enumerate() {
+        *slot = if k == BAND_COUNT {
+            // upper edge of the last band -> Nyquist so high content lands in band 47.
+            (SAMPLE_RATE as f64 / 2.0).max(BAND_HI_HZ)
+        } else {
+            BAND_LO_HZ * ratio.powf(k as f64 / (BAND_COUNT as f64 - 1.0))
+        };
+    }
+    edges
+}
+
 /// Precomputed mapping of each FFT bin to a band index (or `usize::MAX` if the
 /// bin is outside the 30 Hz–16 kHz range and ignored).
 fn build_bin_to_band() -> Vec<usize> {
     let bin_hz = SAMPLE_RATE as f64 / FFT_SIZE as f64; // 46.875 Hz
-    let ratio = BAND_HI_HZ / BAND_LO_HZ;
-    // edges[k] = lower frequency of band k; band k spans [edges[k], edges[k+1]).
-    let edges: Vec<f64> = (0..=BAND_COUNT)
-        .map(|k| {
-            if k == BAND_COUNT {
-                // upper edge of the last band -> Nyquist so high content lands in band 47.
-                (SAMPLE_RATE as f64 / 2.0).max(BAND_HI_HZ)
-            } else {
-                BAND_LO_HZ * ratio.powf(k as f64 / (BAND_COUNT as f64 - 1.0))
-            }
-        })
-        .collect();
+    let edges = band_edges();
 
     let mut map = vec![usize::MAX; SPECTRUM_BINS];
     for (bin, slot) in map.iter_mut().enumerate() {
@@ -109,6 +115,29 @@ fn build_bin_to_band() -> Vec<usize> {
         }
     }
     map
+}
+
+/// Precomputes linear-interpolation bin indices `(lo, hi, frac)` for any band
+/// that contains zero FFT bins (at 48 kHz / 1024-pt FFT, narrow low-frequency
+/// log bands fall between 46.875 Hz bin spacings). Clamped to `1..SPECTRUM_BINS-1`
+/// so DC bin `0` is never sampled.
+fn build_empty_band_interp(
+    band_count_per: &[u32; BAND_COUNT],
+) -> [Option<(usize, usize, f32)>; BAND_COUNT] {
+    let bin_hz = SAMPLE_RATE as f64 / FFT_SIZE as f64;
+    let edges = band_edges();
+    let mut table = [None; BAND_COUNT];
+    for k in 0..BAND_COUNT {
+        if band_count_per[k] == 0 {
+            let f_center = (edges[k] * edges[k + 1]).sqrt();
+            let pos = (f_center / bin_hz).clamp(1.0, (SPECTRUM_BINS - 1) as f64);
+            let lo = pos.floor() as usize;
+            let hi = pos.ceil() as usize;
+            let frac = (pos - lo as f64) as f32;
+            table[k] = Some((lo, hi, frac));
+        }
+    }
+    table
 }
 
 /// The pure analyzer. Construct once, then drive with [`Analyzer::push_samples`].
@@ -129,6 +158,7 @@ pub struct Analyzer {
     // Band mapping & state.
     bin_to_band: Vec<usize>,
     band_count_per: [u32; BAND_COUNT], // bins per band (for averaging)
+    band_interp: [Option<(usize, usize, f32)>; BAND_COUNT], // fallback for 0-bin bands
     band_peak: [f32; BAND_COUNT],      // AGC running peak per band
     band_smooth: [f32; BAND_COUNT],    // smoothed output per band
 
@@ -180,6 +210,7 @@ impl Analyzer {
                 band_count_per[b] += 1;
             }
         }
+        let band_interp = build_empty_band_interp(&band_count_per);
 
         let bin_hz = SAMPLE_RATE as f64 / FFT_SIZE as f64;
         let low_hi_bin = (LOW_HI_HZ / bin_hz).round() as usize;
@@ -201,6 +232,7 @@ impl Analyzer {
             mag: vec![0.0; SPECTRUM_BINS],
             bin_to_band,
             band_count_per,
+            band_interp,
             band_peak: [AGC_PEAK_FLOOR; BAND_COUNT],
             band_smooth: [0.0; BAND_COUNT],
             low_hi_bin,
@@ -316,6 +348,8 @@ impl Analyzer {
         for (k, raw) in band_raw.iter_mut().enumerate() {
             if self.band_count_per[k] > 0 {
                 *raw /= self.band_count_per[k] as f32;
+            } else if let Some((lo, hi, frac)) = self.band_interp[k] {
+                *raw = self.power[lo] * (1.0 - frac) + self.power[hi] * frac;
             }
             // Use amplitude (sqrt of mean power) for a perceptually flatter scale.
             let amp = raw.sqrt();
@@ -447,5 +481,42 @@ mod tests {
         a.push_samples(&zeros, |_, _| {});
         assert_eq!(a.samples_processed, (HOP_SIZE * 4) as u64);
         assert!((a.clock_secs() - (HOP_SIZE * 4) as f64 / SAMPLE_RATE as f64).abs() < 1e-12);
+    }
+
+    #[test]
+    fn low_frequency_bands_have_no_dead_slots_and_preserve_silence() {
+        // Silence must stay strictly zero across all bands (including interpolated ones).
+        let mut silent = Analyzer::new();
+        let zeros = vec![0.0f32; SAMPLE_RATE as usize / 2];
+        let mut last_silent = FeatureFrame::default();
+        silent.push_samples(&zeros, |f, _| last_silent = *f);
+        for (k, &v) in last_silent.bands.iter().enumerate() {
+            assert_eq!(v, 0.0, "silent band {k} must be 0.0, got {v}");
+        }
+
+        // Low-frequency / broadband sum covering 35 Hz..300 Hz must excite ALL bands 0..16.
+        let mut a = Analyzer::new();
+        let n = SAMPLE_RATE as usize / 2;
+        let freqs = [40.0f64, 65.0, 95.0, 140.0, 200.0, 280.0];
+        let signal: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f64 / SAMPLE_RATE as f64;
+                let sum: f64 = freqs
+                    .iter()
+                    .map(|&f| (std::f64::consts::TAU * f * t).sin())
+                    .sum();
+                (sum / freqs.len() as f64 * 0.8) as f32
+            })
+            .collect();
+        let mut last = FeatureFrame::default();
+        a.push_samples(&signal, |f, _| last = *f);
+        for k in 0..16 {
+            assert!(
+                last.bands[k] > 0.05,
+                "low band {k} was dead/under-excited ({}), bands[0..16]={:?}",
+                last.bands[k],
+                &last.bands[..16]
+            );
+        }
     }
 }

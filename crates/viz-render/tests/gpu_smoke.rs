@@ -483,6 +483,7 @@ fn feedback_path_runs_and_draws() {
     }];
     let params = SceneParams {
         feedback_decay: Some(0.9),
+        ..SceneParams::default()
     };
 
     // Two frames so the ping-pong + decay path is exercised, plus the surface blit.
@@ -520,11 +521,50 @@ fn resize_is_glitch_free_clear() {
 
     let params = SceneParams {
         feedback_decay: Some(0.9),
+        ..SceneParams::default()
     };
     let rb = render_scene(&device, &queue, &mut renderer, &params, &[]);
     let center = rb.at_ndc(0.0, 0.0);
     assert!(
         is_clearish(center),
         "empty feedback scene after resize must be clear, got {center:?}"
+    );
+}
+
+#[test]
+fn transparent_bg_clears_alpha_to_zero_on_direct_and_feedback_paths() {
+    let (device, queue) = make_device();
+    let mut renderer = Renderer::new(&device, &queue, FORMAT);
+    renderer.resize(&device, W, H);
+
+    // Direct path with transparent_bg: background pixel must be RGBA (0, 0, 0, 0).
+    let direct_params = SceneParams {
+        feedback_decay: None,
+        transparent_bg: true,
+    };
+    let rb = render_scene(&device, &queue, &mut renderer, &direct_params, &[]);
+    assert_eq!(
+        rb.at_ndc(0.0, 0.0),
+        [0, 0, 0, 0],
+        "direct transparent clear must produce zero alpha"
+    );
+
+    // Feedback path: first render opaque, then toggle to transparent — accumulators
+    // must re-clear cleanly so background reads RGBA (0, 0, 0, 0).
+    let opaque_fb = SceneParams {
+        feedback_decay: Some(0.9),
+        transparent_bg: false,
+    };
+    let _ = render_scene(&device, &queue, &mut renderer, &opaque_fb, &[]);
+
+    let transparent_fb = SceneParams {
+        feedback_decay: Some(0.9),
+        transparent_bg: true,
+    };
+    let rb_fb = render_scene(&device, &queue, &mut renderer, &transparent_fb, &[]);
+    assert_eq!(
+        rb_fb.at_ndc(0.0, 0.0),
+        [0, 0, 0, 0],
+        "feedback transparent clear after toggle must produce zero alpha"
     );
 }

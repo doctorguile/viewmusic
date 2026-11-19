@@ -205,6 +205,9 @@ pub struct SceneParams {
     /// to the surface over a dark clear). `Some(d)` multiplies the previous frame by `d`
     /// before drawing this frame's layers (contract §8).
     pub feedback_decay: Option<f32>,
+    /// When `true`, clear the scene background to transparent (`0, 0, 0, 0`) instead of
+    /// the opaque dark clear color so the desktop shows behind the visualizer.
+    pub transparent_bg: bool,
 }
 
 /// Background clear color used both for the no-feedback direct path and for clearing the
@@ -215,6 +218,9 @@ const CLEAR_COLOR: wgpu::Color = wgpu::Color {
     b: 0.03,
     a: 1.0,
 };
+
+/// Transparent background clear color used when [`SceneParams::transparent_bg`] is enabled.
+const CLEAR_COLOR_TRANSPARENT: wgpu::Color = wgpu::Color::TRANSPARENT;
 
 /// The GPU scene renderer.
 ///
@@ -302,6 +308,12 @@ impl Renderer {
         // Upload all per-layer geometry once, up front, so render passes only bind+draw.
         self.upload(queue, layers);
 
+        let clear_color = if params.transparent_bg {
+            CLEAR_COLOR_TRANSPARENT
+        } else {
+            CLEAR_COLOR
+        };
+
         match params.feedback_decay {
             None => {
                 // Direct path: clear surface, draw layers on top.
@@ -312,7 +324,7 @@ impl Renderer {
                         resolve_target: None,
                         depth_slice: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(CLEAR_COLOR),
+                            load: wgpu::LoadOp::Clear(clear_color),
                             store: wgpu::StoreOp::Store,
                         },
                     })],
@@ -328,7 +340,7 @@ impl Renderer {
                 // Queue the decay scalar before recording the pass that reads it.
                 self.feedback.set_decay(queue, decay);
                 // 1) Multiply the previous accumulator by decay into `curr` (ping-pong).
-                self.feedback.decay_pass(encoder);
+                self.feedback.decay_pass(encoder, params.transparent_bg);
                 // 2) Draw this frame's layers INTO the feedback texture (load, don't clear).
                 {
                     let view = self.feedback.target_view();
@@ -351,7 +363,8 @@ impl Renderer {
                     self.draw_layers(&mut pass, layers);
                 }
                 // 3) Blit feedback → surface (clear the surface first, then copy).
-                self.feedback.blit_to(encoder, surface_view);
+                self.feedback
+                    .blit_to(encoder, surface_view, params.transparent_bg);
             }
         }
     }

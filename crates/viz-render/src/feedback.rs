@@ -17,7 +17,7 @@
 //! no garbage from a stale-sized texture ever flashes during a resize. The roles are also
 //! reset deterministically.
 
-use crate::CLEAR_COLOR;
+use crate::{CLEAR_COLOR, CLEAR_COLOR_TRANSPARENT};
 
 /// Two-texture ping-pong accumulator + the fullscreen decay/blit pipelines.
 ///
@@ -44,11 +44,14 @@ pub struct Feedback {
     /// Bind group for the decay uniform.
     decay_uniform_bind: wgpu::BindGroup,
 
-    /// Set after (re)allocation: both accumulators have undefined contents and must be
+    /// Set after (re)allocation or background-mode toggle: both accumulators must be
     /// cleared before they are first sampled. Cleared lazily at the start of the next
     /// active feedback frame (the encoder is available there; no queue needed for a
     /// clear-load render pass).
     dirty: bool,
+    /// Tracks the previous `transparent_bg` mode so toggling transparency marks the
+    /// accumulators dirty and clears them cleanly to the new background color.
+    last_transparent: bool,
 }
 
 impl Feedback {
@@ -208,6 +211,7 @@ impl Feedback {
             decay_uniform,
             decay_uniform_bind,
             dirty: true,
+            last_transparent: false,
         }
     }
 
@@ -293,9 +297,10 @@ impl Feedback {
         self.dirty = true;
     }
 
-    /// Clears both accumulator textures to the background color if they are dirty
-    /// (post-allocation). Records into the caller's encoder; no queue needed.
-    fn clear_if_dirty(&mut self, encoder: &mut wgpu::CommandEncoder) {
+    /// Clears both accumulator textures to `clear_color` if they are dirty
+    /// (post-allocation or after toggling transparent background). Records into
+    /// the caller's encoder; no queue needed.
+    fn clear_if_dirty(&mut self, encoder: &mut wgpu::CommandEncoder, clear_color: wgpu::Color) {
         if !self.dirty {
             return;
         }
@@ -307,7 +312,7 @@ impl Feedback {
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(CLEAR_COLOR),
+                        load: wgpu::LoadOp::Clear(clear_color),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -334,9 +339,19 @@ impl Feedback {
     /// the layers draw into `curr` with `LoadOp::Load`.
     ///
     /// The decay scalar must already be in the uniform via [`Feedback::set_decay`]
-    /// (queued before recording). Clears freshly (re)allocated accumulators first.
-    pub fn decay_pass(&mut self, encoder: &mut wgpu::CommandEncoder) {
-        self.clear_if_dirty(encoder);
+    /// (queued before recording). Clears freshly (re)allocated accumulators first
+    /// (and re-clears cleanly if `transparent_bg` toggled since the previous frame).
+    pub fn decay_pass(&mut self, encoder: &mut wgpu::CommandEncoder, transparent_bg: bool) {
+        if self.last_transparent != transparent_bg {
+            self.last_transparent = transparent_bg;
+            self.dirty = true;
+        }
+        let clear_color = if transparent_bg {
+            CLEAR_COLOR_TRANSPARENT
+        } else {
+            CLEAR_COLOR
+        };
+        self.clear_if_dirty(encoder, clear_color);
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("feedback-decay"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -345,7 +360,7 @@ impl Feedback {
                 depth_slice: None,
                 ops: wgpu::Operations {
                     // Overwritten entirely by the fullscreen pass.
-                    load: wgpu::LoadOp::Clear(CLEAR_COLOR),
+                    load: wgpu::LoadOp::Clear(clear_color),
                     store: wgpu::StoreOp::Store,
                 },
             })],
@@ -368,7 +383,17 @@ impl Feedback {
 
     /// Records the blit pass: copy `curr` onto `dst` (the surface). Then advances the
     /// ping-pong so next frame's `prev` is this frame's accumulator.
-    pub fn blit_to(&mut self, encoder: &mut wgpu::CommandEncoder, dst: &wgpu::TextureView) {
+    pub fn blit_to(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        dst: &wgpu::TextureView,
+        transparent_bg: bool,
+    ) {
+        let clear_color = if transparent_bg {
+            CLEAR_COLOR_TRANSPARENT
+        } else {
+            CLEAR_COLOR
+        };
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("feedback-blit"),
@@ -377,7 +402,7 @@ impl Feedback {
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(CLEAR_COLOR),
+                        load: wgpu::LoadOp::Clear(clear_color),
                         store: wgpu::StoreOp::Store,
                     },
                 })],

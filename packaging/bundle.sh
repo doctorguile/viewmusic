@@ -18,6 +18,7 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$ROOT/target/release/viewmusic" "$APP/Contents/MacOS/viewmusic"
 cp "$ROOT/packaging/Info.plist" "$APP/Contents/Info.plist"
+cp "$ROOT/packaging/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 
 echo "==> codesign"
 # Prefer a stable Apple Development identity so the TCC audio grant survives rebuilds.

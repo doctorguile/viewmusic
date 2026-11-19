@@ -10,6 +10,8 @@
     <string>ViewMusic</string>
     <key>CFBundleExecutable</key>
     <string>viewmusic</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>

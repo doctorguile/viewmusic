@@ -315,6 +315,7 @@ impl ArtifactRuntime {
         SceneOut {
             params: SceneParams {
                 feedback_decay: None,
+                ..SceneParams::default()
             },
             layers: Vec::new(),
         }
@@ -548,6 +549,7 @@ impl ArtifactRuntime {
         SceneOut {
             params: SceneParams {
                 feedback_decay: self.feedback_decay,
+                ..SceneParams::default()
             },
             layers,
         }

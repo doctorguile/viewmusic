@@ -120,16 +120,30 @@ fn sine_100_is_low() {
     let (frames, _) = run(&mut a, &sig);
     let last = frames.last().unwrap();
     assert!(
-        last.low > last.high,
-        "100 Hz should have low > high: low={} high={}",
+        last.low > last.mid && last.low > last.high,
+        "100 Hz should have low > mid and low > high: low={} mid={} high={}",
         last.low,
+        last.mid,
         last.high
     );
-    let got = argmax_band(&last.bands);
+    // Per-band AGC normalizes every excited band to ~1.0 for a steady tone, so
+    // now that low bands are interpolated (instead of permanently zero), strict
+    // argmax is ambiguous across the Hann main-lobe neighbours. Mirror the
+    // AGC-aware check in `sine_440_dominant_band`.
     let expected = expected_band(100.0);
+    let max_band = last.bands.iter().cloned().fold(0.0_f32, f32::max);
+    let near_100 = (expected.saturating_sub(1)..=(expected + 1).min(BAND_COUNT - 1))
+        .any(|k| (max_band - last.bands[k]).abs() < 1e-3);
     assert!(
-        (got as i32 - expected as i32).abs() <= 1,
-        "100 Hz expected band {expected}, got {got}"
+        near_100,
+        "100 Hz band {expected} (±1) should be at the max ({max_band}); bands={:?}",
+        &last.bands[..]
+    );
+    let far = (expected + 20).min(BAND_COUNT - 1);
+    assert!(
+        last.bands[far] < 0.15,
+        "band {far} far from 100 Hz should be quiet, got {}",
+        last.bands[far]
     );
 }
 
