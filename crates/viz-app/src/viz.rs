@@ -907,6 +907,24 @@ enum WindowShortcut {
     ToggleBorderless,
     /// Toggle transparent window background (`Cmd+T` on macOS, `Ctrl+T` elsewhere).
     ToggleTransparent,
+    /// Cycle to the next loaded visualizer artifact (`Cmd+Y` on macOS, `Ctrl+Y` elsewhere).
+    CycleArtifact,
+}
+
+/// Returns the next artifact id in `entries` after `active`, wrapping around to the
+/// first entry. Returns `None` only when `entries` is empty.
+fn cycle_next_artifact(
+    entries: &[DropdownEntry],
+    active: Option<&ArtifactId>,
+) -> Option<ArtifactId> {
+    if entries.is_empty() {
+        return None;
+    }
+    let next_idx = match active.and_then(|id| entries.iter().position(|e| &e.id == id)) {
+        Some(idx) => (idx + 1) % entries.len(),
+        None => 0,
+    };
+    Some(entries[next_idx].id.clone())
 }
 
 /// Maps a pressed key + modifier state to a [`WindowShortcut`], if any.
@@ -950,6 +968,9 @@ fn match_window_shortcut(
         PhysicalKey::Code(KeyCode::KeyT) => {
             return Some(WindowShortcut::ToggleTransparent);
         }
+        PhysicalKey::Code(KeyCode::KeyY) => {
+            return Some(WindowShortcut::CycleArtifact);
+        }
         _ => {}
     }
 
@@ -961,13 +982,14 @@ fn match_window_shortcut(
         Key::Character("5") => Some(WindowShortcut::Resize(WindowSizePreset::Max)),
         Key::Character("w") | Key::Character("W") => Some(WindowShortcut::ToggleBorderless),
         Key::Character("t") | Key::Character("T") => Some(WindowShortcut::ToggleTransparent),
+        Key::Character("y") | Key::Character("Y") => Some(WindowShortcut::CycleArtifact),
         _ => None,
     }
 }
 
 impl RenderCallback for VizApp {
     fn on_window_event(&mut self, window: &Window, event: &WindowEvent) -> bool {
-        // Track keyboard modifiers for window shortcuts (`Cmd+1..5`, `Cmd+W`, `Cmd+T`).
+        // Track keyboard modifiers for window shortcuts (`Cmd+1..5`, `Cmd+W`, `Cmd+T`, `Cmd+Y`).
         match event {
             WindowEvent::ModifiersChanged(mods) => {
                 self.modifiers = mods.state();
@@ -1003,6 +1025,15 @@ impl RenderCallback for VizApp {
                             let mut next = self.window_mode;
                             next.transparent = !next.transparent;
                             self.set_window_mode(window, next);
+                        }
+                        WindowShortcut::CycleArtifact => {
+                            let next = {
+                                let model = self.model.borrow();
+                                cycle_next_artifact(&model.entries, self.active_id.as_ref())
+                            };
+                            if let Some(id) = next {
+                                self.switch_to(&id);
+                            }
                         }
                     }
                     return true;
@@ -1447,7 +1478,9 @@ fn render_panel_body(ui: &mut egui::Ui, model: &mut OverlayModel) {
                                 model.request.select = Some(entry.id.clone());
                             }
                         }
-                    });
+                    })
+                    .response
+                    .on_hover_text("Select visualizer — ⌘Y to cycle");
 
                 // "Reload artifacts" re-scans built-ins + the user folder from scratch.
                 // VizApp applies it after the egui pass (it rebuilds the library).
@@ -2031,6 +2064,10 @@ mod tests {
             match_window_shortcut(PhysicalKey::Code(KeyCode::KeyT), &empty_key, primary),
             Some(WindowShortcut::ToggleTransparent)
         );
+        assert_eq!(
+            match_window_shortcut(PhysicalKey::Code(KeyCode::KeyY), &empty_key, primary),
+            Some(WindowShortcut::CycleArtifact)
+        );
 
         // Without modifier or with extra Shift/Alt -> ignored.
         assert_eq!(
@@ -2057,5 +2094,36 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn cycle_next_artifact_advances_and_wraps() {
+        assert_eq!(cycle_next_artifact(&[], None), None);
+
+        let a = ArtifactId("alpha".to_owned());
+        let b = ArtifactId("beta".to_owned());
+        let c = ArtifactId("gamma".to_owned());
+        let entries = vec![
+            DropdownEntry {
+                id: a.clone(),
+                name: "Alpha".to_owned(),
+            },
+            DropdownEntry {
+                id: b.clone(),
+                name: "Beta".to_owned(),
+            },
+            DropdownEntry {
+                id: c.clone(),
+                name: "Gamma".to_owned(),
+            },
+        ];
+
+        assert_eq!(cycle_next_artifact(&entries, None), Some(a.clone()));
+        assert_eq!(cycle_next_artifact(&entries, Some(&a)), Some(b.clone()));
+        assert_eq!(cycle_next_artifact(&entries, Some(&b)), Some(c.clone()));
+        assert_eq!(cycle_next_artifact(&entries, Some(&c)), Some(a.clone()));
+        // Unknown active id falls back to the first entry.
+        let missing = ArtifactId("missing".to_owned());
+        assert_eq!(cycle_next_artifact(&entries, Some(&missing)), Some(a));
     }
 }
