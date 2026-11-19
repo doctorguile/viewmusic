@@ -278,7 +278,7 @@ pub struct VizApp {
     on_window_mode_change: Option<WindowModeChangeHook>,
     /// Current live window mode flags (borderless, transparent, always-on-top).
     window_mode: WindowMode,
-    /// Latest keyboard modifier state (drives `Cmd+1..5`, `Cmd+W`, `Cmd+T` shortcuts).
+    /// Latest keyboard modifier state (drives `Cmd+1..5`, `Cmd+W`, `Cmd+T`, `Cmd+Y`, `Cmd+U` shortcuts).
     modifiers: ModifiersState,
     /// Whether the most recently rendered view was [`AppView::Active`], used to keep
     /// non-Active guidance screens opaque even when transparent mode is enabled.
@@ -898,6 +898,13 @@ fn non_permission_capture_failure(
     }
 }
 
+/// Direction to step when cycling through loaded visualizer artifacts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CycleDirection {
+    Next,
+    Prev,
+}
+
 /// Global window keyboard shortcuts handled directly by [`VizApp`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WindowShortcut {
@@ -907,22 +914,30 @@ enum WindowShortcut {
     ToggleBorderless,
     /// Toggle transparent window background (`Cmd+T` on macOS, `Ctrl+T` elsewhere).
     ToggleTransparent,
-    /// Cycle to the next loaded visualizer artifact (`Cmd+Y` on macOS, `Ctrl+Y` elsewhere).
-    CycleArtifact,
+    /// Cycle to the next or previous loaded visualizer artifact (`Cmd+Y`/`Cmd+U` on
+    /// macOS, `Ctrl+Y`/`Ctrl+U` elsewhere).
+    CycleArtifact(CycleDirection),
 }
 
-/// Returns the next artifact id in `entries` after `active`, wrapping around to the
-/// first entry. Returns `None` only when `entries` is empty.
-fn cycle_next_artifact(
+/// Returns the next or previous artifact id in `entries` relative to `active`,
+/// wrapping around at either end. Returns `None` only when `entries` is empty.
+fn cycle_artifact(
     entries: &[DropdownEntry],
     active: Option<&ArtifactId>,
+    direction: CycleDirection,
 ) -> Option<ArtifactId> {
     if entries.is_empty() {
         return None;
     }
     let next_idx = match active.and_then(|id| entries.iter().position(|e| &e.id == id)) {
-        Some(idx) => (idx + 1) % entries.len(),
-        None => 0,
+        Some(idx) => match direction {
+            CycleDirection::Next => (idx + 1) % entries.len(),
+            CycleDirection::Prev => idx.checked_sub(1).unwrap_or(entries.len() - 1),
+        },
+        None => match direction {
+            CycleDirection::Next => 0,
+            CycleDirection::Prev => entries.len() - 1,
+        },
     };
     Some(entries[next_idx].id.clone())
 }
@@ -969,7 +984,10 @@ fn match_window_shortcut(
             return Some(WindowShortcut::ToggleTransparent);
         }
         PhysicalKey::Code(KeyCode::KeyY) => {
-            return Some(WindowShortcut::CycleArtifact);
+            return Some(WindowShortcut::CycleArtifact(CycleDirection::Next));
+        }
+        PhysicalKey::Code(KeyCode::KeyU) => {
+            return Some(WindowShortcut::CycleArtifact(CycleDirection::Prev));
         }
         _ => {}
     }
@@ -982,14 +1000,19 @@ fn match_window_shortcut(
         Key::Character("5") => Some(WindowShortcut::Resize(WindowSizePreset::Max)),
         Key::Character("w") | Key::Character("W") => Some(WindowShortcut::ToggleBorderless),
         Key::Character("t") | Key::Character("T") => Some(WindowShortcut::ToggleTransparent),
-        Key::Character("y") | Key::Character("Y") => Some(WindowShortcut::CycleArtifact),
+        Key::Character("y") | Key::Character("Y") => {
+            Some(WindowShortcut::CycleArtifact(CycleDirection::Next))
+        }
+        Key::Character("u") | Key::Character("U") => {
+            Some(WindowShortcut::CycleArtifact(CycleDirection::Prev))
+        }
         _ => None,
     }
 }
 
 impl RenderCallback for VizApp {
     fn on_window_event(&mut self, window: &Window, event: &WindowEvent) -> bool {
-        // Track keyboard modifiers for window shortcuts (`Cmd+1..5`, `Cmd+W`, `Cmd+T`, `Cmd+Y`).
+        // Track keyboard modifiers for window shortcuts (`Cmd+1..5`, `Cmd+W`, `Cmd+T`, `Cmd+Y`, `Cmd+U`).
         match event {
             WindowEvent::ModifiersChanged(mods) => {
                 self.modifiers = mods.state();
@@ -1026,10 +1049,10 @@ impl RenderCallback for VizApp {
                             next.transparent = !next.transparent;
                             self.set_window_mode(window, next);
                         }
-                        WindowShortcut::CycleArtifact => {
+                        WindowShortcut::CycleArtifact(direction) => {
                             let next = {
                                 let model = self.model.borrow();
-                                cycle_next_artifact(&model.entries, self.active_id.as_ref())
+                                cycle_artifact(&model.entries, self.active_id.as_ref(), direction)
                             };
                             if let Some(id) = next {
                                 self.switch_to(&id);
@@ -1480,7 +1503,7 @@ fn render_panel_body(ui: &mut egui::Ui, model: &mut OverlayModel) {
                         }
                     })
                     .response
-                    .on_hover_text("Select visualizer — ⌘Y to cycle");
+                    .on_hover_text("Select visualizer — ⌘Y next, ⌘U previous");
 
                 // "Reload artifacts" re-scans built-ins + the user folder from scratch.
                 // VizApp applies it after the egui pass (it rebuilds the library).
@@ -2066,7 +2089,22 @@ mod tests {
         );
         assert_eq!(
             match_window_shortcut(PhysicalKey::Code(KeyCode::KeyY), &empty_key, primary),
-            Some(WindowShortcut::CycleArtifact)
+            Some(WindowShortcut::CycleArtifact(CycleDirection::Next))
+        );
+        assert_eq!(
+            match_window_shortcut(PhysicalKey::Code(KeyCode::KeyU), &empty_key, primary),
+            Some(WindowShortcut::CycleArtifact(CycleDirection::Prev))
+        );
+
+        let unidentified_physical =
+            PhysicalKey::Unidentified(winit::keyboard::NativeKeyCode::Unidentified);
+        assert_eq!(
+            match_window_shortcut(unidentified_physical, &Key::Character("u".into()), primary),
+            Some(WindowShortcut::CycleArtifact(CycleDirection::Prev))
+        );
+        assert_eq!(
+            match_window_shortcut(unidentified_physical, &Key::Character("U".into()), primary),
+            Some(WindowShortcut::CycleArtifact(CycleDirection::Prev))
         );
 
         // Without modifier or with extra Shift/Alt -> ignored.
@@ -2094,11 +2132,20 @@ mod tests {
             ),
             None
         );
+        assert_eq!(
+            match_window_shortcut(
+                PhysicalKey::Code(KeyCode::KeyU),
+                &empty_key,
+                primary | ModifiersState::SHIFT
+            ),
+            None
+        );
     }
 
     #[test]
-    fn cycle_next_artifact_advances_and_wraps() {
-        assert_eq!(cycle_next_artifact(&[], None), None);
+    fn cycle_artifact_advances_reverses_and_wraps() {
+        assert_eq!(cycle_artifact(&[], None, CycleDirection::Next), None);
+        assert_eq!(cycle_artifact(&[], None, CycleDirection::Prev), None);
 
         let a = ArtifactId("alpha".to_owned());
         let b = ArtifactId("beta".to_owned());
@@ -2118,12 +2165,62 @@ mod tests {
             },
         ];
 
-        assert_eq!(cycle_next_artifact(&entries, None), Some(a.clone()));
-        assert_eq!(cycle_next_artifact(&entries, Some(&a)), Some(b.clone()));
-        assert_eq!(cycle_next_artifact(&entries, Some(&b)), Some(c.clone()));
-        assert_eq!(cycle_next_artifact(&entries, Some(&c)), Some(a.clone()));
-        // Unknown active id falls back to the first entry.
+        // Forward (Cmd+Y)
+        assert_eq!(
+            cycle_artifact(&entries, None, CycleDirection::Next),
+            Some(a.clone())
+        );
+        assert_eq!(
+            cycle_artifact(&entries, Some(&a), CycleDirection::Next),
+            Some(b.clone())
+        );
+        assert_eq!(
+            cycle_artifact(&entries, Some(&b), CycleDirection::Next),
+            Some(c.clone())
+        );
+        assert_eq!(
+            cycle_artifact(&entries, Some(&c), CycleDirection::Next),
+            Some(a.clone())
+        );
+
+        // Backward (Cmd+U)
+        assert_eq!(
+            cycle_artifact(&entries, None, CycleDirection::Prev),
+            Some(c.clone())
+        );
+        assert_eq!(
+            cycle_artifact(&entries, Some(&c), CycleDirection::Prev),
+            Some(b.clone())
+        );
+        assert_eq!(
+            cycle_artifact(&entries, Some(&b), CycleDirection::Prev),
+            Some(a.clone())
+        );
+        assert_eq!(
+            cycle_artifact(&entries, Some(&a), CycleDirection::Prev),
+            Some(c.clone())
+        );
+
+        // Single-entry list wraps to itself in both directions.
+        let single = vec![entries[0].clone()];
+        assert_eq!(
+            cycle_artifact(&single, Some(&a), CycleDirection::Next),
+            Some(a.clone())
+        );
+        assert_eq!(
+            cycle_artifact(&single, Some(&a), CycleDirection::Prev),
+            Some(a.clone())
+        );
+
+        // Unknown active id falls back to the first entry (Next) or last entry (Prev).
         let missing = ArtifactId("missing".to_owned());
-        assert_eq!(cycle_next_artifact(&entries, Some(&missing)), Some(a));
+        assert_eq!(
+            cycle_artifact(&entries, Some(&missing), CycleDirection::Next),
+            Some(a)
+        );
+        assert_eq!(
+            cycle_artifact(&entries, Some(&missing), CycleDirection::Prev),
+            Some(c)
+        );
     }
 }
