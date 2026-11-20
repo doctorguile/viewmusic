@@ -23,6 +23,17 @@ pub const MAX_TEMPS: usize = 64;
 /// x, y, w, h, rot, c0, c1, c2, a = 9).
 pub const MAX_MULTI_OUTS: usize = 10;
 
+/// Items evaluated together by [`Vm::eval_multi_batch`].
+pub const BATCH_LANES: usize = 64;
+
+/// Per-item slots (e.g. `i`/`u`, or `i`/`x`) a batch can vary across lanes.
+pub const BATCH_SLOTS: usize = 2;
+
+/// One `f64` per batch lane.
+pub type Lanes = [f64; BATCH_LANES];
+
+const _: () = assert!(MAX_TEMPS <= 64 && MAX_MULTI_OUTS <= 16);
+
 /// One flat 4-byte bytecode instruction. Slot and constant indices are resolved
 /// at compile time so the hot loop uses a single flat jump table with zero
 /// nested matching and zero argument-slice copies.
@@ -205,6 +216,11 @@ pub struct MultiProgram {
     /// `fixed_outs[idx] = Some(temp_slot)` or `None` if written by `item_ops`.
     pub(crate) const_outs: [Option<f64>; MAX_MULTI_OUTS],
     pub(crate) reads_slots: Vec<u16>,
+    /// Bit `t` set if `temps[t]` differs per item (column temps and temps written by
+    /// `item_ops`); all other temps are uniform across a batch.
+    pub(crate) item_lane_temps: u64,
+    /// Bit `o` set if `item_ops` writes output `o`.
+    pub(crate) item_outs: u16,
 }
 
 impl MultiProgram {
@@ -260,6 +276,27 @@ pub struct Vm {
     stack: [f64; STACK_SIZE],
     /// Fixed-size temporary bank for hoisted + CSE subexpressions.
     temps: [f64; MAX_TEMPS],
+    /// Column-wise registers for [`Vm::eval_multi_batch`].
+    batch: Box<BatchBank>,
+}
+
+/// Per-lane stack, temps, inputs and outputs for [`Vm::eval_multi_batch`].
+struct BatchBank {
+    stack: [Lanes; STACK_SIZE],
+    temps: [Lanes; MAX_TEMPS],
+    slots: [Lanes; BATCH_SLOTS],
+    outs: [Lanes; MAX_MULTI_OUTS],
+}
+
+impl BatchBank {
+    fn new_boxed() -> Box<Self> {
+        Box::new(Self {
+            stack: [[0.0; BATCH_LANES]; STACK_SIZE],
+            temps: [[0.0; BATCH_LANES]; MAX_TEMPS],
+            slots: [[0.0; BATCH_LANES]; BATCH_SLOTS],
+            outs: [[0.0; BATCH_LANES]; MAX_MULTI_OUTS],
+        })
+    }
 }
 
 impl Vm {
@@ -271,6 +308,7 @@ impl Vm {
             seed,
             stack: [0.0; STACK_SIZE],
             temps: [0.0; MAX_TEMPS],
+            batch: BatchBank::new_boxed(),
         }
     }
 
@@ -455,6 +493,80 @@ impl Vm {
         );
     }
 
+    /// Per-lane input values for the per-item slots of the next
+    /// [`Vm::eval_multi_batch`] call (`[k]` pairs with `lane_slots[k]`).
+    #[inline]
+    pub fn batch_slot_lanes_mut(&mut self) -> &mut [Lanes; BATCH_SLOTS] {
+        &mut self.batch.slots
+    }
+
+    /// Per-lane outputs of the last [`Vm::eval_multi_batch`] call (`[out][lane]`).
+    #[inline]
+    pub fn batch_outs(&self) -> &[Lanes; MAX_MULTI_OUTS] {
+        &self.batch.outs
+    }
+
+    /// Evaluates `item_ops` for `lanes` items at once, producing bitwise the same
+    /// outputs as calling [`Vm::eval_multi_item`] once per item (the scalar slots and
+    /// temps are left untouched). Each op runs over all lanes before the next, so
+    /// dispatch is paid once per op per batch.
+    ///
+    /// Lane `k` sees slot `lane_slots[j]` as `batch_slot_lanes_mut()[j][k]` and, for
+    /// `Field` layers, its column values at `col_src[k * num_col..(k + 1) * num_col]`
+    /// (the layout [`Vm::eval_multi_col`] fills). Every other slot and temp is shared.
+    /// `outs` holds the hoisted/row outputs, as passed to [`Vm::eval_multi_item`].
+    /// Results are read from [`Vm::batch_outs`].
+    pub fn eval_multi_batch(
+        &mut self,
+        mp: &MultiProgram,
+        lanes: usize,
+        lane_slots: [Option<crate::SlotId>; BATCH_SLOTS],
+        col_src: &[f64],
+        outs: &[f64; MAX_MULTI_OUTS],
+    ) {
+        let n = lanes.min(BATCH_LANES);
+        let bank = &mut *self.batch;
+        for (o, dst) in bank.outs.iter_mut().enumerate().take(mp.num_outputs) {
+            if mp.item_outs & (1 << o) == 0 {
+                dst[..n].fill(outs[o]);
+            }
+        }
+        if mp.item_ops.is_empty() {
+            return;
+        }
+        let mut lane_slot_ids = [u32::MAX; BATCH_SLOTS];
+        for (j, slot) in lane_slots.iter().enumerate() {
+            if let Some(s) = slot {
+                lane_slot_ids[j] = s.0 as u32;
+                for v in &mut bank.slots[j][..n] {
+                    *v = sanitize(*v);
+                }
+            }
+        }
+        if mp.num_col > 0 {
+            for (k, src) in col_src.chunks_exact(mp.num_col).take(n).enumerate() {
+                for (c, &v) in src.iter().enumerate() {
+                    bank.temps[mp.col_base + c][k] = v;
+                }
+            }
+        }
+        let slots = self.slots.as_slice();
+        let slots_in_bounds = mp.max_slot.is_none_or(|m| (m as usize) < slots.len());
+        run_ops_batch(
+            &mp.item_ops,
+            &mp.consts,
+            slots,
+            slots_in_bounds,
+            lane_slot_ids,
+            mp.item_lane_temps,
+            &self.temps,
+            bank,
+            n,
+            &self.frame,
+            self.seed,
+        );
+    }
+
     /// Applies a built-in to its operand slice `a` (length == the op's arity).
     /// All inputs are already sanitized (finite); the caller sanitizes the
     /// result. Public so the property test's reference evaluator uses identical
@@ -579,26 +691,7 @@ fn run_ops(
                 }
                 let b = stack[sp - 1];
                 sp -= 1;
-                let a = stack[sp - 1];
-                // Fast path for exact non-negative u32 integers (e.g. `i % 18`, `i % 20`):
-                // avoids libsystem_m `fmod` (~80–150 cycles) while remaining bitwise
-                // identical (including `-0.0` sign bit preservation).
-                stack[sp - 1] =
-                    if b > 0.0 && (0.0..4_294_967_296.0).contains(&a) && b < 4_294_967_296.0 {
-                        let ai = a as u32;
-                        let bi = b as u32;
-                        if ai as f64 == a && bi as f64 == b && bi != 0 {
-                            if a == 0.0 {
-                                a
-                            } else {
-                                (ai % bi) as f64
-                            }
-                        } else {
-                            sanitize(a % b)
-                        }
-                    } else {
-                        sanitize(a % b)
-                    };
+                stack[sp - 1] = rem(stack[sp - 1], b);
             }
             Op::Pow => {
                 if sp < 2 {
@@ -869,14 +962,7 @@ fn run_ops(
                 if sp < 1 {
                     return 0.0;
                 }
-                let k = stack[sp - 1];
-                let key = if k == 0.0 { 0.0 } else { k };
-                let mut z = seed ^ key.to_bits().wrapping_mul(0x9E37_79B9_7F4A_7C15);
-                z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
-                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-                z ^= z >> 31;
-                stack[sp - 1] = ((z >> 11) as f64) * (1.0 / 9_007_199_254_740_992.0);
+                stack[sp - 1] = rand_hash(seed, stack[sp - 1]);
             }
         }
     }
@@ -884,6 +970,203 @@ fn run_ops(
         0.0
     } else {
         stack[sp - 1]
+    }
+}
+
+/// `a % b` (sanitized). Fast path for exact non-negative u32 integers (e.g. `i % 18`,
+/// `i % 20`): avoids libsystem_m `fmod` (~80–150 cycles) while remaining bitwise
+/// identical (including `-0.0` sign bit preservation).
+#[inline(always)]
+fn rem(a: f64, b: f64) -> f64 {
+    if b > 0.0 && (0.0..4_294_967_296.0).contains(&a) && b < 4_294_967_296.0 {
+        let ai = a as u32;
+        let bi = b as u32;
+        if ai as f64 == a && bi as f64 == b && bi != 0 {
+            if a == 0.0 {
+                a
+            } else {
+                (ai % bi) as f64
+            }
+        } else {
+            sanitize(a % b)
+        }
+    } else {
+        sanitize(a % b)
+    }
+}
+
+/// `rand(k)` on a finite `k`; same hash as [`Vm::rand`].
+#[inline(always)]
+fn rand_hash(seed: u64, k: f64) -> f64 {
+    let key = if k == 0.0 { 0.0 } else { k };
+    let mut z = seed ^ key.to_bits().wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    ((z >> 11) as f64) * (1.0 / 9_007_199_254_740_992.0)
+}
+
+/// Batch counterpart of [`run_ops`] for `item_ops`: the stack sequence of a program
+/// does not depend on values, so `sp` is shared by all lanes and each op becomes a
+/// loop over `n` lanes applying the exact scalar expression of [`run_ops`].
+#[allow(clippy::too_many_arguments)]
+fn run_ops_batch(
+    ops: &[Op],
+    consts: &[f64],
+    slots: &[f64],
+    slots_in_bounds: bool,
+    lane_slot_ids: [u32; BATCH_SLOTS],
+    lane_temps: u64,
+    temps: &[f64; MAX_TEMPS],
+    bank: &mut BatchBank,
+    n: usize,
+    frame: &FeatureFrame,
+    seed: u64,
+) {
+    let BatchBank {
+        stack,
+        temps: lane_temp_bank,
+        slots: lane_slot_bank,
+        outs,
+    } = bank;
+    let mut sp: usize = 0;
+
+    macro_rules! unary {
+        ($f:expr) => {{
+            if sp < 1 {
+                return;
+            }
+            let f = $f;
+            for v in &mut stack[sp - 1][..n] {
+                *v = f(*v);
+            }
+        }};
+    }
+    macro_rules! binary {
+        ($f:expr) => {{
+            if sp < 2 {
+                return;
+            }
+            let f = $f;
+            let (lo, hi) = stack.split_at_mut(sp - 1);
+            for (a, &b) in lo[sp - 2][..n].iter_mut().zip(&hi[0][..n]) {
+                *a = f(*a, b);
+            }
+            sp -= 1;
+        }};
+    }
+    macro_rules! ternary {
+        ($f:expr) => {{
+            if sp < 3 {
+                return;
+            }
+            let f = $f;
+            let (lo, hi) = stack.split_at_mut(sp - 2);
+            let (b, c) = hi.split_at(1);
+            for ((a, &b), &c) in lo[sp - 3][..n].iter_mut().zip(&b[0][..n]).zip(&c[0][..n]) {
+                *a = f(*a, b, c);
+            }
+            sp -= 2;
+        }};
+    }
+
+    for &op in ops {
+        match op {
+            Op::Const(idx) => {
+                if sp < STACK_SIZE {
+                    stack[sp][..n].fill(consts[idx as usize]);
+                    sp += 1;
+                }
+            }
+            Op::Load(id) => {
+                if sp < STACK_SIZE {
+                    if let Some(j) = lane_slot_ids.iter().position(|&s| s == id as u32) {
+                        stack[sp][..n].copy_from_slice(&lane_slot_bank[j][..n]);
+                    } else {
+                        let v = if slots_in_bounds {
+                            slots[id as usize]
+                        } else {
+                            slots.get(id as usize).copied().unwrap_or(0.0)
+                        };
+                        stack[sp][..n].fill(v);
+                    }
+                    sp += 1;
+                }
+            }
+            Op::StoreTemp(idx) => {
+                if sp >= 1 && (idx as usize) < MAX_TEMPS {
+                    lane_temp_bank[idx as usize][..n].copy_from_slice(&stack[sp - 1][..n]);
+                }
+            }
+            Op::PopTemp(idx) => {
+                if sp >= 1 && (idx as usize) < MAX_TEMPS {
+                    sp -= 1;
+                    lane_temp_bank[idx as usize][..n].copy_from_slice(&stack[sp][..n]);
+                }
+            }
+            Op::LoadTemp(idx) => {
+                if sp < STACK_SIZE && (idx as usize) < MAX_TEMPS {
+                    if lane_temps & (1 << idx) != 0 {
+                        stack[sp][..n].copy_from_slice(&lane_temp_bank[idx as usize][..n]);
+                    } else {
+                        stack[sp][..n].fill(temps[idx as usize]);
+                    }
+                    sp += 1;
+                }
+            }
+            Op::StoreOut(idx) => {
+                if sp >= 1 && (idx as usize) < MAX_MULTI_OUTS {
+                    sp -= 1;
+                    outs[idx as usize][..n].copy_from_slice(&stack[sp][..n]);
+                }
+            }
+            Op::Neg => unary!(|a: f64| -a),
+            Op::Not => unary!(|a: f64| bool_val(!truthy(a))),
+            Op::Add => binary!(|a: f64, b: f64| sanitize(a + b)),
+            Op::Sub => binary!(|a: f64, b: f64| sanitize(a - b)),
+            Op::Mul => binary!(|a: f64, b: f64| sanitize(a * b)),
+            Op::Div => binary!(|a: f64, b: f64| sanitize(a / b)),
+            Op::Rem => binary!(rem),
+            Op::Pow => binary!(|a: f64, b: f64| sanitize(a.powf(b))),
+            Op::Square => unary!(|a: f64| sanitize(a * a)),
+            Op::Lt => binary!(|a: f64, b: f64| bool_val(a < b)),
+            Op::Le => binary!(|a: f64, b: f64| bool_val(a <= b)),
+            Op::Gt => binary!(|a: f64, b: f64| bool_val(a > b)),
+            Op::Ge => binary!(|a: f64, b: f64| bool_val(a >= b)),
+            Op::Eq => binary!(|a: f64, b: f64| bool_val(a == b)),
+            Op::Ne => binary!(|a: f64, b: f64| bool_val(a != b)),
+            Op::And => binary!(|a: f64, b: f64| bool_val(truthy(a) && truthy(b))),
+            Op::Or => binary!(|a: f64, b: f64| bool_val(truthy(a) || truthy(b))),
+            Op::Sin => unary!(f64::sin),
+            Op::Cos => unary!(f64::cos),
+            Op::Tan => unary!(|a: f64| sanitize(a.tan())),
+            Op::Asin => unary!(|a: f64| sanitize(a.asin())),
+            Op::Acos => unary!(|a: f64| sanitize(a.acos())),
+            Op::Atan => unary!(f64::atan),
+            Op::Atan2 => binary!(f64::atan2),
+            Op::Exp => unary!(|a: f64| sanitize(a.exp())),
+            Op::Log => unary!(|a: f64| sanitize(a.ln())),
+            Op::Log2 => unary!(|a: f64| sanitize(a.log2())),
+            Op::Log10 => unary!(|a: f64| sanitize(a.log10())),
+            Op::Sqrt => unary!(|a: f64| sanitize(a.sqrt())),
+            Op::Abs => unary!(f64::abs),
+            Op::Sign => unary!(sign),
+            Op::Floor => unary!(f64::floor),
+            Op::Ceil => unary!(f64::ceil),
+            Op::Round => unary!(f64::round),
+            Op::Fract => unary!(f64::fract),
+            Op::Min => binary!(f64::min),
+            Op::Max => binary!(f64::max),
+            Op::Clamp => ternary!(clamp),
+            Op::Mix => ternary!(|a: f64, b: f64, t: f64| sanitize(mix(a, b, t))),
+            Op::Smoothstep => ternary!(|e0: f64, e1: f64, x: f64| sanitize(smoothstep(e0, e1, x))),
+            Op::Step => binary!(step),
+            Op::If => ternary!(|c: f64, a: f64, b: f64| if truthy(c) { a } else { b }),
+            Op::Band => unary!(|a: f64| frame.band(a)),
+            Op::Wave => unary!(|a: f64| frame.wave(a)),
+            Op::Rand => unary!(|k: f64| rand_hash(seed, k)),
+        }
     }
 }
 

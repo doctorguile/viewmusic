@@ -1033,6 +1033,21 @@ pub fn compile_multi(
     let mut reads_slots: Vec<u16> = reads_slots_set.into_iter().collect();
     reads_slots.sort_unstable();
 
+    let mut item_lane_temps: u64 = 0;
+    for t in col_base..col_base + num_col {
+        item_lane_temps |= 1 << t;
+    }
+    let mut item_outs: u16 = 0;
+    for op in &item_ops {
+        match *op {
+            Op::StoreTemp(t) | Op::PopTemp(t) if (t as usize) < MAX_TEMPS => {
+                item_lane_temps |= 1 << t;
+            }
+            Op::StoreOut(o) if (o as usize) < MAX_MULTI_OUTS => item_outs |= 1 << o,
+            _ => {}
+        }
+    }
+
     Ok(MultiProgram {
         hoisted_ops,
         row_ops,
@@ -1045,6 +1060,8 @@ pub fn compile_multi(
         num_outputs: inputs.len(),
         const_outs,
         reads_slots,
+        item_lane_temps,
+        item_outs,
     })
 }
 

@@ -23,7 +23,7 @@ use viz_contract::{
     SettingSlots, Shape,
 };
 use viz_core::FeatureFrame;
-use viz_expr::{compile_multi, MultiInput, MultiProgram, Vm, MAX_MULTI_OUTS};
+use viz_expr::{compile_multi, Lanes, MultiInput, MultiProgram, Vm, BATCH_LANES, MAX_MULTI_OUTS};
 use viz_render::{
     BlendMode, InstanceData, LayerDraw, PointData, SceneParams, ShapeKind, MAX_FIELD_CELLS,
     MAX_FIELD_RES, MAX_INSTANCES, MAX_POINTS,
@@ -372,33 +372,35 @@ impl ArtifactRuntime {
                     [0.0; 4]
                 };
 
-                for i in 0..n {
-                    if cl.reads_i {
-                        self.vm.set_slot(s_i, i as f64);
+                let lane_slots = [cl.reads_i.then_some(s_i), cl.reads_u.then_some(s_u)];
+                for start in (0..n).step_by(BATCH_LANES) {
+                    let lanes = (n - start).min(BATCH_LANES);
+                    fill_index_lanes(self.vm.batch_slot_lanes_mut(), start, lanes, inv_denom);
+                    self.vm
+                        .eval_multi_batch(&cl.prog, lanes, lane_slots, &[], &outs);
+                    let bo = self.vm.batch_outs();
+                    #[allow(clippy::needless_range_loop)] // `bo` is `[out][lane]`
+                    for k in 0..lanes {
+                        let col = if cl.color_frame_invariant {
+                            hoisted_col
+                        } else {
+                            pack_color(
+                                cl.color_model,
+                                bo[5][k],
+                                bo[6][k],
+                                bo[7][k],
+                                bo[8][k].clamp(0.0, 1.0) as f32,
+                            )
+                        };
+                        self.instances.push(InstanceData {
+                            x: bo[0][k] as f32,
+                            y: bo[1][k] as f32,
+                            w: bo[2][k] as f32,
+                            h: bo[3][k] as f32,
+                            rot: bo[4][k] as f32,
+                            color: col,
+                        });
                     }
-                    if cl.reads_u {
-                        self.vm.set_slot(s_u, i as f64 * inv_denom);
-                    }
-                    self.vm.eval_multi_item(&cl.prog, &mut outs);
-                    let col = if cl.color_frame_invariant {
-                        hoisted_col
-                    } else {
-                        pack_color(
-                            cl.color_model,
-                            outs[5],
-                            outs[6],
-                            outs[7],
-                            outs[8].clamp(0.0, 1.0) as f32,
-                        )
-                    };
-                    self.instances.push(InstanceData {
-                        x: outs[0] as f32,
-                        y: outs[1] as f32,
-                        w: outs[2] as f32,
-                        h: outs[3] as f32,
-                        rot: outs[4] as f32,
-                        color: col,
-                    });
                 }
                 LayerSlot::Instanced {
                     offset,
@@ -442,30 +444,32 @@ impl ArtifactRuntime {
                     [0.0; 4]
                 };
 
-                for i in 0..n {
-                    if cl.reads_i {
-                        self.vm.set_slot(s_i, i as f64);
+                let lane_slots = [cl.reads_i.then_some(s_i), cl.reads_u.then_some(s_u)];
+                for start in (0..n).step_by(BATCH_LANES) {
+                    let lanes = (n - start).min(BATCH_LANES);
+                    fill_index_lanes(self.vm.batch_slot_lanes_mut(), start, lanes, inv_denom);
+                    self.vm
+                        .eval_multi_batch(&cl.prog, lanes, lane_slots, &[], &outs);
+                    let bo = self.vm.batch_outs();
+                    #[allow(clippy::needless_range_loop)] // `bo` is `[out][lane]`
+                    for k in 0..lanes {
+                        let col = if cl.color_frame_invariant {
+                            hoisted_col
+                        } else {
+                            pack_color(
+                                cl.color_model,
+                                bo[2][k],
+                                bo[3][k],
+                                bo[4][k],
+                                bo[5][k].clamp(0.0, 1.0) as f32,
+                            )
+                        };
+                        self.points.push(PointData {
+                            x: bo[0][k] as f32,
+                            y: bo[1][k] as f32,
+                            color: col,
+                        });
                     }
-                    if cl.reads_u {
-                        self.vm.set_slot(s_u, i as f64 * inv_denom);
-                    }
-                    self.vm.eval_multi_item(&cl.prog, &mut outs);
-                    let col = if cl.color_frame_invariant {
-                        hoisted_col
-                    } else {
-                        pack_color(
-                            cl.color_model,
-                            outs[2],
-                            outs[3],
-                            outs[4],
-                            outs[5].clamp(0.0, 1.0) as f32,
-                        )
-                    };
-                    self.points.push(PointData {
-                        x: outs[0] as f32,
-                        y: outs[1] as f32,
-                        color: col,
-                    });
                 }
                 LayerSlot::Polyline {
                     offset,
@@ -546,6 +550,7 @@ impl ArtifactRuntime {
                     }
                 }
 
+                let lane_slots = [cl.reads_x.then_some(s_x), cl.reads_i.then_some(s_i)];
                 let mut idx = 0usize;
                 for row in 0..res {
                     let cy = -1.0 + (row as f64 + 0.5) * inv;
@@ -554,27 +559,28 @@ impl ArtifactRuntime {
                     }
                     self.vm.eval_multi_row(&cl.prog, &mut outs);
 
-                    for col in 0..res_usize {
-                        if cl.reads_x {
-                            let cx = -1.0 + (col as f64 + 0.5) * inv;
-                            self.vm.set_slot(s_x, cx);
+                    for col0 in (0..res_usize).step_by(BATCH_LANES) {
+                        let lanes = (res_usize - col0).min(BATCH_LANES);
+                        let [xs, is] = self.vm.batch_slot_lanes_mut();
+                        for k in 0..lanes {
+                            xs[k] = -1.0 + ((col0 + k) as f64 + 0.5) * inv;
+                            is[k] = (idx + k) as f64;
                         }
-                        if cl.reads_i {
-                            self.vm.set_slot(s_i, idx as f64);
+                        let src = &self.col_scratch[col0 * num_col..(col0 + lanes) * num_col];
+                        self.vm
+                            .eval_multi_batch(&cl.prog, lanes, lane_slots, src, &outs);
+                        let bo = self.vm.batch_outs();
+                        #[allow(clippy::needless_range_loop)] // `bo` is `[out][lane]`
+                        for k in 0..lanes {
+                            self.cells.push(pack_color(
+                                cl.color_model,
+                                bo[0][k],
+                                bo[1][k],
+                                bo[2][k],
+                                bo[3][k].clamp(0.0, 1.0) as f32,
+                            ));
                         }
-                        if num_col > 0 {
-                            let src = &self.col_scratch[col * num_col..(col + 1) * num_col];
-                            self.vm.load_multi_col(&cl.prog, src);
-                        }
-                        self.vm.eval_multi_item(&cl.prog, &mut outs);
-                        self.cells.push(pack_color(
-                            cl.color_model,
-                            outs[0],
-                            outs[1],
-                            outs[2],
-                            outs[3].clamp(0.0, 1.0) as f32,
-                        ));
-                        idx += 1;
+                        idx += lanes;
                     }
                 }
                 LayerSlot::Field {
@@ -847,6 +853,17 @@ fn hsv_to_rgb_f32(h: f32, s: f32, v: f32) -> (f32, f32, f32) {
         v * (1.0 + s * (p.clamp(0.0, 1.0) - 1.0))
     };
     (f(0.0), f(2.0 / 3.0), f(1.0 / 3.0))
+}
+
+/// Fills the `i` and `u` lanes of a batch for items `start..start + lanes`.
+#[inline]
+fn fill_index_lanes(lanes_out: &mut [Lanes; 2], start: usize, lanes: usize, inv_denom: f64) {
+    let [is, us] = lanes_out;
+    for k in 0..lanes {
+        let i = (start + k) as f64;
+        is[k] = i;
+        us[k] = i * inv_denom;
+    }
 }
 
 /// Evaluates an optional `visible` gate: absent ⇒ visible; present ⇒ `>= 0.5`.
