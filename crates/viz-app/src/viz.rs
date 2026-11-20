@@ -1147,9 +1147,8 @@ impl RenderCallback for VizApp {
             }
         }
 
-        // Renderer target resizing needs the wgpu device, which is only available
-        // in `render`; it reconciles the renderer size against `frame.config` every
-        // frame, so a `Resized` event needs no special handling here.
+        // `Renderer::render` follows the surface texture size every frame, so a
+        // `Resized` event needs no special handling here.
         //
         // In borderless mode, left-clicking the empty canvas (outside the overlay)
         // starts a native OS window drag. Check hit-testing BEFORE forwarding the
@@ -1198,12 +1197,6 @@ impl RenderCallback for VizApp {
     }
 
     fn render(&mut self, frame: &mut FrameContext<'_>) {
-        // Resize the renderer's targets to the current surface each frame (cheap
-        // no-op when unchanged; covers initial size + window resizes uniformly).
-        if let Some(r) = self.renderer.as_mut() {
-            r.resize(frame.device, frame.config.width, frame.config.height);
-        }
-
         let (feature, dt, capture_failure, permission) = self.poll_audio();
         let has_artifact = self.runtime.is_some();
         let view = select_view(
