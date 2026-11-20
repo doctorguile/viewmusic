@@ -69,6 +69,11 @@ pub struct GpuContext {
     pub config: wgpu::SurfaceConfiguration,
     /// The chosen surface texture format (cached for pipeline/overlay construction).
     pub format: wgpu::TextureFormat,
+    /// Alpha mode used while the callback wants a transparent background.
+    transparent_alpha_mode: wgpu::CompositeAlphaMode,
+    /// Alpha mode used otherwise: `Opaque` when supported, so the compositor does not
+    /// blend the window with what is behind it.
+    opaque_alpha_mode: wgpu::CompositeAlphaMode,
 }
 
 impl GpuContext {
@@ -122,17 +127,25 @@ impl GpuContext {
         // Prefer premultiplied alpha so transparent window mode composites cleanly
         // (Metal supports PreMultiplied and viz-render shaders emit premultiplied RGBA).
         let caps = surface.get_capabilities(&adapter);
-        if caps
+        let transparent_alpha_mode = if caps
             .alpha_modes
             .contains(&wgpu::CompositeAlphaMode::PreMultiplied)
         {
-            config.alpha_mode = wgpu::CompositeAlphaMode::PreMultiplied;
+            wgpu::CompositeAlphaMode::PreMultiplied
         } else if caps
             .alpha_modes
             .contains(&wgpu::CompositeAlphaMode::PostMultiplied)
         {
-            config.alpha_mode = wgpu::CompositeAlphaMode::PostMultiplied;
-        }
+            wgpu::CompositeAlphaMode::PostMultiplied
+        } else {
+            config.alpha_mode
+        };
+        let opaque_alpha_mode = if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
+            wgpu::CompositeAlphaMode::Opaque
+        } else {
+            transparent_alpha_mode
+        };
+        config.alpha_mode = opaque_alpha_mode;
         let format = config.format;
 
         surface.configure(&device, &config);
@@ -143,6 +156,23 @@ impl GpuContext {
             queue,
             config,
             format,
+            transparent_alpha_mode,
+            opaque_alpha_mode,
+        }
+    }
+
+    /// Switches the surface between the opaque and transparent alpha modes,
+    /// reconfiguring only when the mode changes. Must not be called while a surface
+    /// texture is acquired.
+    fn set_transparent(&mut self, transparent: bool) {
+        let alpha_mode = if transparent {
+            self.transparent_alpha_mode
+        } else {
+            self.opaque_alpha_mode
+        };
+        if self.config.alpha_mode != alpha_mode {
+            self.config.alpha_mode = alpha_mode;
+            self.surface.configure(&self.device, &self.config);
         }
     }
 
@@ -254,6 +284,7 @@ pub struct WindowMode {
 /// Applies live-toggleable [`WindowMode`] properties to an existing window.
 pub fn apply_window_mode(window: &Window, mode: WindowMode) {
     window.set_decorations(!mode.borderless);
+    window.set_transparent(mode.transparent);
     window.set_window_level(if mode.always_on_top {
         WindowLevel::AlwaysOnTop
     } else {
@@ -579,6 +610,7 @@ impl<C: RenderCallback> App<C> {
         let (Some(window), Some(gpu)) = (self.window.as_ref(), self.gpu.as_mut()) else {
             return RenderOutcome::RetryLater;
         };
+        gpu.set_transparent(self.callback.wants_transparent_clear());
 
         let surface_texture = match gpu.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
@@ -655,6 +687,9 @@ impl<C: RenderCallback> App<C> {
         // Tell winit we are about to present so it can pace the next redraw.
         window.pre_present_notify();
         surface_texture.present();
+        // The callback decides transparency while rendering (view switch, toggle), so
+        // re-check now that the texture is released instead of waiting a frame.
+        gpu.set_transparent(self.callback.wants_transparent_clear());
         RenderOutcome::Presented
     }
 }
@@ -667,11 +702,11 @@ impl<C: RenderCallback> ApplicationHandler for App<C> {
         }
 
         let mode = self.window_mode;
-        // Always enable transparent surface support at creation so Transparent mode
-        // can be toggled live at runtime without recreating the window.
+        // An opaque window lets the compositor skip what is behind it; Transparent
+        // mode toggles it live via `apply_window_mode`.
         let mut attrs = Window::default_attributes()
             .with_title("ViewMusic")
-            .with_transparent(true)
+            .with_transparent(mode.transparent)
             .with_decorations(!mode.borderless)
             .with_resizable(true)
             .with_window_level(if mode.always_on_top {
