@@ -4,9 +4,9 @@
 
 struct FieldParams {
     base: u32,
-    count: u32,
     res: u32,
-    _pad: u32,
+    _pad0: u32,
+    _pad1: u32,
 };
 
 @group(0) @binding(0) var<storage, read> cells: array<vec4<f32>>;
@@ -14,7 +14,9 @@ struct FieldParams {
 
 struct VsOut {
     @builtin(position) clip: vec4<f32>,
-    @location(0) uv: vec2<f32>,
+    // All vertices have w = 1, so linear equals perspective-correct interpolation
+    // without the per-fragment 1/w.
+    @location(0) @interpolate(linear) uv: vec2<f32>,
 };
 
 @vertex
@@ -30,14 +32,13 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
 }
 
 fn shade(in: VsOut) -> vec4<f32> {
+    // Pixel centers keep uv at least half a pixel inside (0, 1), so col/row are always in
+    // 0..res without clamping. The CPU zero-fills missing cells, which both blends leave
+    // as a no-op, so there is no bounds check or discard.
     let res_f = f32(params.res);
-    let col = min(u32(max(in.uv.x, 0.0) * res_f), params.res - 1u);
-    let row = min(u32(max(in.uv.y, 0.0) * res_f), params.res - 1u);
-    let idx = row * params.res + col;
-    if idx >= params.count {
-        discard;
-    }
-    let c = cells[params.base + idx];
+    let col = u32(in.uv.x * res_f);
+    let row = u32(in.uv.y * res_f);
+    let c = cells[params.base + row * params.res + col];
     return vec4<f32>(c.rgb * c.a, c.a);
 }
 

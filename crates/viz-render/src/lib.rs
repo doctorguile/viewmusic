@@ -450,7 +450,10 @@ impl Renderer {
                         occlusion_query_set: None,
                         multiview_mask: None,
                     });
-                    self.feedback.draw_decay(&mut pass);
+                    // A leading opaque field overwrites every pixel of the decay draw.
+                    if !self.field.covers_pass() {
+                        self.feedback.draw_decay(&mut pass);
+                    }
                     self.draw_layers(&mut pass, layers, PassTargets::FeedbackAndSurface);
                 }
                 self.feedback.end_frame();
@@ -472,7 +475,7 @@ impl Renderer {
         self.instanced.begin_frame();
         self.polyline.begin_frame();
         self.field.begin_frame();
-        for layer in layers {
+        for (i, layer) in layers.iter().enumerate() {
             match layer {
                 LayerDraw::Instanced {
                     shape,
@@ -511,6 +514,7 @@ impl Renderer {
                         *blend,
                         *resolution,
                         cells,
+                        i == 0,
                     );
                 }
             }

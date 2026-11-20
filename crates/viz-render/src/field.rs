@@ -8,6 +8,9 @@
 //! Each layer uploads one region: its [`FieldParams`] in the first `param_stride` bytes
 //! (bound as a dynamic-offset uniform) followed by its cells (read through a storage
 //! binding of the whole buffer, indexed from `params.base`).
+//!
+//! A leading alpha field whose cells are all opaque hides everything below it, so it is
+//! drawn with blending off and replaces the pass's decay draw ([`FieldPipelines::covers_pass`]).
 
 use std::num::NonZeroU64;
 
@@ -22,26 +25,30 @@ const MAX_LAYERS: usize = 16;
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct FieldParams {
     base: u32,
-    count: u32,
     res: u32,
-    _pad: u32,
+    _pad: [u32; 2],
 }
 
 /// One field layer recorded this frame.
 #[derive(Clone, Copy)]
 struct LayerRecord {
     blend: BlendMode,
-    count: u32,
+    has_cells: bool,
+    /// Leading alpha layer with all `res²` cells at alpha exactly 1: blending it is
+    /// `src * 1 + dst * 0`, so it is drawn unblended and covers the whole pass.
+    covers_pass: bool,
     /// Index into [`FieldPipelines::bind_groups`] for the buffer holding the region.
     bind_group: usize,
     /// Byte offset of the layer's region (its params) in that buffer.
     dynamic_offset: u32,
 }
 
-/// Field pipelines (one per pass targets × blend) + per-buffer bind groups.
+/// Field pipelines (one per pass targets × blend, plus unblended) + per-buffer bind groups.
 pub struct FieldPipelines {
     /// `pipelines[targets][blend]`.
     pipelines: [[wgpu::RenderPipeline; 2]; 2],
+    /// `unblended[targets]`, for [`LayerRecord::covers_pass`] layers.
+    unblended: [wgpu::RenderPipeline; 2],
     bind_layout: wgpu::BindGroupLayout,
     /// Copy destination holding `MAX_LAYERS` maximal regions; `None` when the draws bind
     /// the upload chunks directly.
@@ -58,7 +65,7 @@ pub struct FieldPipelines {
 }
 
 impl FieldPipelines {
-    /// Builds the four pipelines (and the region copy target unless uploads are `direct`).
+    /// Builds the six pipelines (and the region copy target unless uploads are `direct`).
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat, direct: bool) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("field-shader"),
@@ -104,7 +111,7 @@ impl FieldPipelines {
             immediate_size: 0,
         });
 
-        let make = |targets: PassTargets, blend: BlendMode| {
+        let make = |targets: PassTargets, blend: Option<wgpu::BlendState>| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("field-pipeline"),
                 layout: Some(&layout),
@@ -126,7 +133,7 @@ impl FieldPipelines {
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                     targets: &targets.color_targets(wgpu::ColorTargetState {
                         format,
-                        blend: Some(blend.state()),
+                        blend,
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
                 }),
@@ -137,10 +144,11 @@ impl FieldPipelines {
 
         let pipelines = PassTargets::ALL.map(|targets| {
             [
-                make(targets, BlendMode::Alpha),
-                make(targets, BlendMode::Add),
+                make(targets, Some(BlendMode::Alpha.state())),
+                make(targets, Some(BlendMode::Add.state())),
             ]
         });
+        let unblended = PassTargets::ALL.map(|targets| make(targets, None));
 
         let copy_target = (!direct).then(|| {
             device.create_buffer(&wgpu::BufferDescriptor {
@@ -156,6 +164,7 @@ impl FieldPipelines {
 
         Self {
             pipelines,
+            unblended,
             bind_layout,
             copy_target,
             bind_groups: Vec::new(),
@@ -174,7 +183,10 @@ impl FieldPipelines {
     /// Uploads the raw cell colors for one field layer directly (zero CPU packing loop).
     ///
     /// `resolution` is clamped to `2..=MAX_FIELD_RES`. `cells` holds up to `resolution²`
-    /// straight-alpha RGBA colors row-major from bottom-left.
+    /// straight-alpha RGBA colors row-major from bottom-left; missing trailing cells are
+    /// uploaded as transparent `[0; 4]`, which both blend modes leave as a no-op.
+    /// `leading`: the layer is the first one drawn in the pass.
+    #[allow(clippy::too_many_arguments)]
     pub fn push(
         &mut self,
         device: &wgpu::Device,
@@ -183,6 +195,7 @@ impl FieldPipelines {
         blend: BlendMode,
         resolution: u32,
         cells: &[[f32; 4]],
+        leading: bool,
     ) {
         if self.records.len() >= MAX_LAYERS {
             return;
@@ -194,7 +207,8 @@ impl FieldPipelines {
         if take == 0 {
             self.records.push(LayerRecord {
                 blend,
-                count: 0,
+                has_cells: false,
+                covers_pass: false,
                 bind_group: 0,
                 dynamic_offset: 0,
             });
@@ -203,7 +217,7 @@ impl FieldPipelines {
 
         let cell_bytes: &[u8] = bytemuck::cast_slice(&cells[..take]);
         let stride = self.param_stride as u64;
-        let region = stride + cell_bytes.len() as u64;
+        let region = stride + (total * std::mem::size_of::<[f32; 4]>()) as u64;
         let (mut view, buffer, offset) = upload.write(
             encoder,
             self.copy_target.as_ref(),
@@ -213,14 +227,20 @@ impl FieldPipelines {
         );
         let params = FieldParams {
             base: ((offset + stride) / std::mem::size_of::<[f32; 4]>() as u64) as u32,
-            count: take as u32,
             res,
-            _pad: 0,
+            _pad: [0; 2],
         };
         view.slice(..std::mem::size_of::<FieldParams>())
             .copy_from_slice(bytemuck::bytes_of(&params));
-        view.slice(self.param_stride..).copy_from_slice(cell_bytes);
+        let cells_end = self.param_stride + cell_bytes.len();
+        view.slice(self.param_stride..cells_end)
+            .copy_from_slice(cell_bytes);
+        view.slice(cells_end..).fill(0);
         drop(view);
+        let covers_pass = leading
+            && blend == BlendMode::Alpha
+            && take == total
+            && cells[..take].iter().all(|c| c[3] == 1.0);
 
         let layout = &self.bind_layout;
         let bind_group = cached_bind_group(&mut self.bind_groups, &buffer, |buffer| {
@@ -246,11 +266,18 @@ impl FieldPipelines {
 
         self.records.push(LayerRecord {
             blend,
-            count: take as u32,
+            has_cells: true,
+            covers_pass,
             bind_group,
             dynamic_offset: offset as u32,
         });
         self.cursor += region.next_multiple_of(stride);
+    }
+
+    /// `true` when the first field layer pushed this frame was pushed as `leading` and
+    /// draws every pixel opaque, so whatever the pass draws before it is hidden.
+    pub fn covers_pass(&self) -> bool {
+        self.records.first().is_some_and(|rec| rec.covers_pass)
     }
 
     /// Records the draw for the `idx`-th field layer pushed this frame (3 vertices).
@@ -258,10 +285,14 @@ impl FieldPipelines {
         let Some(&rec) = self.records.get(idx) else {
             return;
         };
-        if rec.count == 0 {
+        if !rec.has_cells {
             return;
         }
-        pass.set_pipeline(&self.pipelines[targets.index()][rec.blend as usize]);
+        pass.set_pipeline(if rec.covers_pass {
+            &self.unblended[targets.index()]
+        } else {
+            &self.pipelines[targets.index()][rec.blend as usize]
+        });
         pass.set_bind_group(
             0,
             &self.bind_groups[rec.bind_group].1,
