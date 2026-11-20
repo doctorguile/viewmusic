@@ -16,7 +16,7 @@
 //!
 //! ## Real-time discipline
 //! Per-frame layer data goes through a reusable staging belt (see [`upload`]). With
-//! [`device_features`] enabled on a unified-memory GPU the draws bind the belt's mapped
+//! [`device_features`] enabled (integrated GPUs on Metal) the draws bind the belt's mapped
 //! chunks directly and a frame records no copy commands; otherwise the belt copies into
 //! buffers pre-allocated to the contract maxima ([`MAX_INSTANCES`], [`MAX_POINTS`],
 //! [`MAX_FIELD_CELLS`]). In steady state no buffers are created, and there is no heap
@@ -41,11 +41,14 @@ pub use degrade::DegradeController;
 
 /// Optional device features the renderer uses; request them in `request_device`.
 ///
-/// On a unified-memory GPU, [`wgpu::Features::MAPPABLE_PRIMARY_BUFFERS`] lets the draws
-/// bind the mapped upload buffers directly, so frames record no copy commands. It is not
-/// requested on discrete GPUs, where mapped buffers live across the bus.
+/// On an integrated (unified-memory) GPU on the Metal backend,
+/// [`wgpu::Features::MAPPABLE_PRIMARY_BUFFERS`] lets the draws bind the mapped upload
+/// buffers directly, so frames record no copy commands. It is not requested on discrete
+/// GPUs, where mapped buffers live across the bus, nor on other backends, where the
+/// direct path has not been measured or pixel-checked; those keep the copy path.
 pub fn device_features(adapter: &wgpu::Adapter) -> wgpu::Features {
-    if adapter.get_info().device_type == wgpu::DeviceType::IntegratedGpu {
+    let info = adapter.get_info();
+    if info.backend == wgpu::Backend::Metal && info.device_type == wgpu::DeviceType::IntegratedGpu {
         adapter.features() & wgpu::Features::MAPPABLE_PRIMARY_BUFFERS
     } else {
         wgpu::Features::empty()

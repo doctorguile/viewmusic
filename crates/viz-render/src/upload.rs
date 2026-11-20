@@ -1,7 +1,7 @@
 //! Per-frame upload of layer geometry and parameters.
 //!
 //! With [`wgpu::Features::MAPPABLE_PRIMARY_BUFFERS`] (requested by [`crate::device_features`]
-//! on unified-memory GPUs) the staging belt's mapped chunks are created with
+//! on integrated GPUs on Metal) the staging belt's mapped chunks are created with
 //! vertex/storage/uniform usage and the draws bind them directly, so a frame records no
 //! copy commands. Otherwise the belt copies each write into the caller's persistent
 //! buffer. Either way chunks are recycled by the belt once the GPU is done with them.
