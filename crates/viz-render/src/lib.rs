@@ -292,6 +292,9 @@ pub struct Renderer {
     feedback: feedback::Feedback,
     /// Per-frame upload of layer data through reusable mapped buffers.
     upload: upload::Uploader,
+    /// This frame's first layer is an opaque field ([`field::FieldPipelines::push`]): it
+    /// is drawn unblended and hides everything the pass draws before it.
+    leading_opaque_field: bool,
 }
 
 impl Renderer {
@@ -323,6 +326,7 @@ impl Renderer {
             field,
             feedback,
             upload,
+            leading_opaque_field: false,
         }
     }
 
@@ -456,7 +460,7 @@ impl Renderer {
                         multiview_mask: None,
                     });
                     // A leading opaque field overwrites every pixel of the decay draw.
-                    if !self.field.covers_pass() {
+                    if !self.leading_opaque_field {
                         self.feedback.draw_decay(&mut pass);
                     }
                     self.draw_layers(&mut pass, layers, PassTargets::FeedbackAndSurface);
@@ -480,6 +484,7 @@ impl Renderer {
         self.instanced.begin_frame();
         self.polyline.begin_frame();
         self.field.begin_frame();
+        self.leading_opaque_field = false;
         for (i, layer) in layers.iter().enumerate() {
             match layer {
                 LayerDraw::Instanced {
@@ -512,15 +517,17 @@ impl Renderer {
                     resolution,
                     cells,
                 } => {
-                    self.field.push(
+                    let opaque = self.field.push(
                         device,
                         &mut self.upload,
                         encoder,
                         *blend,
                         *resolution,
                         cells,
-                        i == 0,
                     );
+                    if i == 0 {
+                        self.leading_opaque_field = opaque;
+                    }
                 }
             }
         }
@@ -538,7 +545,7 @@ impl Renderer {
         let mut inst_idx = 0;
         let mut poly_idx = 0;
         let mut field_idx = 0;
-        for layer in layers {
+        for (i, layer) in layers.iter().enumerate() {
             match layer {
                 LayerDraw::Instanced { .. } => {
                     self.instanced.draw(pass, inst_idx, targets);
@@ -549,7 +556,8 @@ impl Renderer {
                     poly_idx += 1;
                 }
                 LayerDraw::Field { .. } => {
-                    self.field.draw(pass, field_idx, targets);
+                    let unblended = i == 0 && self.leading_opaque_field;
+                    self.field.draw(pass, field_idx, targets, unblended);
                     field_idx += 1;
                 }
             }

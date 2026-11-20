@@ -9,8 +9,9 @@
 //! (bound as a dynamic-offset uniform) followed by its cells (read through a storage
 //! binding of the whole buffer, indexed from `params.base`).
 //!
-//! A leading alpha field whose cells are all opaque hides everything below it, so it is
-//! drawn with blending off and replaces the pass's decay draw ([`FieldPipelines::covers_pass`]).
+//! A leading alpha field whose cells are all opaque hides everything below it, so the
+//! renderer draws it with blending off and skips the pass's decay draw (see the return
+//! value of [`FieldPipelines::push`]).
 
 use std::num::NonZeroU64;
 
@@ -34,9 +35,6 @@ struct FieldParams {
 struct LayerRecord {
     blend: BlendMode,
     has_cells: bool,
-    /// Leading alpha layer with all `res²` cells at alpha exactly 1: blending it is
-    /// `src * 1 + dst * 0`, so it is drawn unblended and covers the whole pass.
-    covers_pass: bool,
     /// Index into [`FieldPipelines::bind_groups`] for the buffer holding the region.
     bind_group: usize,
     /// Byte offset of the layer's region (its params) in that buffer.
@@ -47,7 +45,7 @@ struct LayerRecord {
 pub struct FieldPipelines {
     /// `pipelines[targets][blend]`.
     pipelines: [[wgpu::RenderPipeline; 2]; 2],
-    /// `unblended[targets]`, for [`LayerRecord::covers_pass`] layers.
+    /// `unblended[targets]`, for a leading opaque layer (see [`FieldPipelines::push`]).
     unblended: [wgpu::RenderPipeline; 2],
     bind_layout: wgpu::BindGroupLayout,
     /// Copy destination holding `MAX_LAYERS` maximal regions; `None` when the draws bind
@@ -185,8 +183,10 @@ impl FieldPipelines {
     /// `resolution` is clamped to `2..=MAX_FIELD_RES`. `cells` holds up to `resolution²`
     /// straight-alpha RGBA colors row-major from bottom-left; missing trailing cells are
     /// uploaded as transparent `[0; 4]`, which both blend modes leave as a no-op.
-    /// `leading`: the layer is the first one drawn in the pass.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// Returns `true` when the layer is opaque: alpha blend with all `res²` cells at
+    /// alpha exactly 1. Blending it is then `src * 1 + dst * 0`, so as the first layer of
+    /// a pass it covers every pixel and may be drawn unblended ([`FieldPipelines::draw`]).
     pub fn push(
         &mut self,
         device: &wgpu::Device,
@@ -195,10 +195,9 @@ impl FieldPipelines {
         blend: BlendMode,
         resolution: u32,
         cells: &[[f32; 4]],
-        leading: bool,
-    ) {
+    ) -> bool {
         if self.records.len() >= MAX_LAYERS {
-            return;
+            return false;
         }
 
         let res = resolution.clamp(2, MAX_FIELD_RES);
@@ -208,11 +207,10 @@ impl FieldPipelines {
             self.records.push(LayerRecord {
                 blend,
                 has_cells: false,
-                covers_pass: false,
                 bind_group: 0,
                 dynamic_offset: 0,
             });
-            return;
+            return false;
         }
 
         let cell_bytes: &[u8] = bytemuck::cast_slice(&cells[..take]);
@@ -237,10 +235,8 @@ impl FieldPipelines {
             .copy_from_slice(cell_bytes);
         view.slice(cells_end..).fill(0);
         drop(view);
-        let covers_pass = leading
-            && blend == BlendMode::Alpha
-            && take == total
-            && cells[..take].iter().all(|c| c[3] == 1.0);
+        let opaque =
+            blend == BlendMode::Alpha && take == total && cells[..take].iter().all(|c| c[3] == 1.0);
 
         let layout = &self.bind_layout;
         let bind_group = cached_bind_group(&mut self.bind_groups, &buffer, |buffer| {
@@ -267,28 +263,30 @@ impl FieldPipelines {
         self.records.push(LayerRecord {
             blend,
             has_cells: true,
-            covers_pass,
             bind_group,
             dynamic_offset: offset as u32,
         });
         self.cursor += region.next_multiple_of(stride);
-    }
-
-    /// `true` when the first field layer pushed this frame was pushed as `leading` and
-    /// draws every pixel opaque, so whatever the pass draws before it is hidden.
-    pub fn covers_pass(&self) -> bool {
-        self.records.first().is_some_and(|rec| rec.covers_pass)
+        opaque
     }
 
     /// Records the draw for the `idx`-th field layer pushed this frame (3 vertices).
-    pub fn draw<'p>(&'p self, pass: &mut wgpu::RenderPass<'p>, idx: usize, targets: PassTargets) {
+    /// `unblended`: the layer is the pass's first and [`FieldPipelines::push`] reported it
+    /// opaque, so it is drawn with blending off.
+    pub fn draw<'p>(
+        &'p self,
+        pass: &mut wgpu::RenderPass<'p>,
+        idx: usize,
+        targets: PassTargets,
+        unblended: bool,
+    ) {
         let Some(&rec) = self.records.get(idx) else {
             return;
         };
         if !rec.has_cells {
             return;
         }
-        pass.set_pipeline(if rec.covers_pass {
+        pass.set_pipeline(if unblended {
             &self.unblended[targets.index()]
         } else {
             &self.pipelines[targets.index()][rec.blend as usize]
