@@ -48,8 +48,12 @@ pub struct Onset {
     hist_pos: usize,
     /// How many spectra have been pushed (warm-up gate).
     hist_filled: usize,
-    /// Scratch for the current max-filtered log spectrum.
-    max_filtered: Vec<f32>,
+    /// Consecutive all-zero spectra pushed into `history` (once `>= history.len()`,
+    /// all history slots are already zeroed so silence fast-path skips clearing).
+    zero_hist_run: usize,
+    /// Pre-allocated scratch for `log1p(mag[k])` (computed once per bin, reused for
+    /// both max-filtering and flux to cut `ln_1p` calls by 75%).
+    log_mag: Vec<f32>,
     /// Ring of recent flux values feeding the adaptive threshold.
     flux_window: [f32; THRESHOLD_WINDOW],
     flux_pos: usize,
@@ -69,7 +73,8 @@ impl Onset {
             history: (0..depth).map(|_| vec![0.0; bins]).collect(),
             hist_pos: 0,
             hist_filled: 0,
-            max_filtered: vec![0.0; bins],
+            zero_hist_run: depth,
+            log_mag: vec![0.0; bins],
             flux_window: [0.0; THRESHOLD_WINDOW],
             flux_pos: 0,
             flux_filled: 0,
@@ -81,14 +86,43 @@ impl Onset {
     /// Resets all internal state (used on capture restart / between test runs).
     pub fn reset(&mut self) {
         for h in &mut self.history {
-            h.iter_mut().for_each(|v| *v = 0.0);
+            h.fill(0.0);
         }
         self.hist_pos = 0;
         self.hist_filled = 0;
+        self.zero_hist_run = self.history.len();
         self.flux_window = [0.0; THRESHOLD_WINDOW];
         self.flux_pos = 0;
         self.flux_filled = 0;
         self.last_onset_t = f64::NEG_INFINITY;
+    }
+
+    /// Fast path for an identically silent hop (`mag == 0` for all bins): zero
+    /// `ln_1p` calls, skips clearing `history` once all ring slots are already zero,
+    /// and still advances `hist_pos` and the causal `flux_window` identically to
+    /// [`Self::process`].
+    pub fn process_silence(&mut self) -> OnsetResult {
+        let depth = self.history.len();
+        if self.zero_hist_run < depth {
+            self.history[self.hist_pos].fill(0.0);
+            self.zero_hist_run += 1;
+        }
+        self.hist_pos = (self.hist_pos + 1) % depth;
+        if self.hist_filled < depth {
+            self.hist_filled += 1;
+        }
+
+        // Silent hop has flux = 0.0 (never exceeds THRESHOLD_FLOOR > 0).
+        self.flux_window[self.flux_pos] = 0.0;
+        self.flux_pos = (self.flux_pos + 1) % THRESHOLD_WINDOW;
+        if self.flux_filled < THRESHOLD_WINDOW {
+            self.flux_filled += 1;
+        }
+
+        OnsetResult {
+            is_onset: false,
+            strength: 0.0,
+        }
     }
 
     /// Feeds one magnitude spectrum (`mag.len() == bins`) at audio-clock time `t`.
@@ -96,32 +130,21 @@ impl Onset {
     /// Allocation-free. Returns whether this hop is an onset and its strength.
     pub fn process(&mut self, mag: &[f32], t: f64) -> OnsetResult {
         debug_assert_eq!(mag.len(), self.bins);
+        self.zero_hist_run = 0;
 
-        // 1. log-magnitude of the current spectrum, max-filtered across frequency.
-        //    `max_filtered[k] = max over [k-r, k+r] of log1p(mag)`.
-        for (k, slot) in self.max_filtered.iter_mut().enumerate() {
-            let lo = k.saturating_sub(MAX_FILTER_RADIUS);
-            let hi = (k + MAX_FILTER_RADIUS).min(self.bins - 1);
-            let mut m = f32::NEG_INFINITY;
-            for &v in &mag[lo..=hi] {
-                let lv = v.max(0.0).ln_1p();
-                if lv > m {
-                    m = lv;
-                }
-            }
-            *slot = m;
+        // 1. Compute log1p(max(mag[k], 0)) ONCE per bin (reused by flux + max-filter).
+        for (dst, &v) in self.log_mag.iter_mut().zip(mag.iter()) {
+            *dst = v.max(0.0).ln_1p();
         }
 
-        // 2. positive flux of the *current raw log spectrum* against the
-        //    max-filtered reference FLUX_LAG frames ago.
+        // 2. Positive flux of the current raw log spectrum against the max-filtered
+        //    reference `FLUX_LAG` frames ago (read BEFORE overwriting `history[hist_pos]`).
+        let depth = self.history.len();
         let mut flux = 0.0f32;
         if self.hist_filled >= FLUX_LAG {
-            // Index of the reference frame: FLUX_LAG slots before the write head.
-            let depth = self.history.len();
             let ref_idx = (self.hist_pos + depth - FLUX_LAG) % depth;
             let reference = &self.history[ref_idx];
-            for (&m, &r) in mag.iter().zip(reference.iter()) {
-                let cur = m.max(0.0).ln_1p();
+            for (&cur, &r) in self.log_mag.iter().zip(reference.iter()) {
                 let diff = cur - r;
                 if diff > 0.0 {
                     flux += diff;
@@ -129,10 +152,23 @@ impl Onset {
             }
         }
 
-        // 3. store the current max-filtered spectrum as future reference.
-        self.history[self.hist_pos].copy_from_slice(&self.max_filtered);
-        self.hist_pos = (self.hist_pos + 1) % self.history.len();
-        if self.hist_filled < self.history.len() {
+        // 3. Max-filter `log_mag` across [k-r, k+r] directly into `history[hist_pos]`
+        //    (avoids a separate scratch buffer + 2 KB memcpy).
+        let dst_hist = &mut self.history[self.hist_pos];
+        let last = self.bins - 1;
+        for (k, slot) in dst_hist.iter_mut().enumerate() {
+            let lo = k.saturating_sub(MAX_FILTER_RADIUS);
+            let hi = (k + MAX_FILTER_RADIUS).min(last);
+            let mut m = f32::NEG_INFINITY;
+            for &lv in &self.log_mag[lo..=hi] {
+                if lv > m {
+                    m = lv;
+                }
+            }
+            *slot = m;
+        }
+        self.hist_pos = (self.hist_pos + 1) % depth;
+        if self.hist_filled < depth {
             self.hist_filled += 1;
         }
 

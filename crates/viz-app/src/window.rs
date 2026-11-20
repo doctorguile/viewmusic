@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::WindowEvent;
-use winit::event_loop::ActiveEventLoop;
+use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::window::{Window, WindowId, WindowLevel};
 
 /// Hard 60 Hz frame budget. Presents closer together than this are skipped so the
@@ -148,10 +148,27 @@ impl GpuContext {
 
     /// Reconfigures the surface to a new physical size (resize / scale change).
     ///
-    /// Zero-sized requests are ignored (minimized window) to avoid wgpu panics, and
-    /// dimensions are clamped to the device's maximum texture extent so a move onto
-    /// a display larger than the GPU supports degrades instead of panicking.
+    /// Zero-sized requests are ignored (minimized window) to avoid wgpu panics,
+    /// unchanged clamped dimensions are skipped to avoid redundant swapchain rebuilds,
+    /// and dimensions are clamped to the device's maximum texture extent so a move
+    /// onto a display larger than the GPU supports degrades instead of panicking.
     fn resize(&mut self, size: PhysicalSize<u32>) {
+        if size.width == 0 || size.height == 0 {
+            return;
+        }
+        let max_dim = self.device.limits().max_texture_dimension_2d;
+        let new_w = size.width.min(max_dim);
+        let new_h = size.height.min(max_dim);
+        if self.config.width == new_w && self.config.height == new_h {
+            return;
+        }
+        self.config.width = new_w;
+        self.config.height = new_h;
+        self.surface.configure(&self.device, &self.config);
+    }
+
+    /// Unconditionally reconfigures the surface after `Outdated` or `Lost`.
+    fn reconfigure(&mut self, size: PhysicalSize<u32>) {
         if size.width == 0 || size.height == 0 {
             return;
         }
@@ -203,6 +220,24 @@ pub trait RenderCallback {
     fn wants_transparent_clear(&self) -> bool {
         false
     }
+
+    /// Whether the callback clears the surface texture itself (e.g. `viz-render`
+    /// already clears the swapchain with `LoadOp::Clear`), allowing the shell to
+    /// omit its redundant pre-clear render pass.
+    fn owns_surface_clear(&self) -> bool {
+        false
+    }
+
+    /// Desired interval until the next frame. Values below [`MIN_FRAME_INTERVAL`]
+    /// are clamped up to the hard 60 Hz cap; larger values let the event loop sleep
+    /// longer when showing static guidance or during sustained silence.
+    fn desired_frame_interval(&self) -> Duration {
+        MIN_FRAME_INTERVAL
+    }
+
+    /// Invoked immediately after `queue.submit(...)` so the renderer can recall
+    /// `StagingBelt` buffers for reuse on the next frame.
+    fn on_post_submit(&mut self) {}
 }
 
 /// Live-toggleable window presentation flags.
@@ -434,6 +469,39 @@ pub fn should_present(now: Instant, last_present: Option<Instant>, min_interval:
     }
 }
 
+/// Result of attempting to acquire, render, and present one swapchain frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RenderOutcome {
+    /// A frame was rendered and presented.
+    Presented,
+    /// Swapchain reported occlusion; caller should back off without spinning.
+    Occluded,
+    /// Transient surface error (`Timeout`, `Outdated`, `Lost`, `Validation`); back off.
+    RetryLater,
+}
+
+/// Computes the next redraw deadline for [`App::about_to_wait`].
+///
+/// Pure function so scheduling behavior is unit-testable without a window.
+#[must_use]
+fn next_frame_deadline(
+    now: Instant,
+    last_present: Option<Instant>,
+    next_redraw_at: Option<Instant>,
+    desired_interval: Duration,
+    wake_immediately: bool,
+) -> Instant {
+    if wake_immediately {
+        return last_present.map(|p| p + MIN_FRAME_INTERVAL).unwrap_or(now);
+    }
+    let interval = desired_interval.max(MIN_FRAME_INTERVAL);
+    let desired = last_present.map(|p| p + interval).unwrap_or(now);
+    match next_redraw_at {
+        Some(backoff) => backoff.max(desired),
+        None => desired,
+    }
+}
+
 /// The winit application: owns the window, GPU context, render callback, and pacing
 /// state. A `&mut` reference is passed to [`winit::event_loop::EventLoop::run_app`].
 pub struct App<C: RenderCallback> {
@@ -442,6 +510,18 @@ pub struct App<C: RenderCallback> {
     callback: C,
     /// Instant of the last actually-presented frame (drives 60 Hz pacing).
     last_present: Option<Instant>,
+    /// Earliest instant at which the next redraw should be requested (includes
+    /// backoff after transient surface errors or `CurrentSurfaceTexture::Occluded`).
+    next_redraw_at: Option<Instant>,
+    /// True after `window.request_redraw()` until the matching `RedrawRequested` runs.
+    redraw_in_flight: bool,
+    /// Set by OS `WindowEvent::Occluded(true)`; pauses rendering until unoccluded.
+    occluded: bool,
+    /// Set when the window's physical size is `0×0` (minimized); pauses rendering.
+    minimized: bool,
+    /// Set on user input / resize / unocclusion so throttled intervals snap back
+    /// immediately to the next 60 Hz slot.
+    wake_immediately: bool,
     /// Hook invoked exactly once after the GPU context first exists, so the host can
     /// build GPU-dependent resources (e.g. the egui renderer needs the surface format).
     on_ready: Option<ReadyHook<C>>,
@@ -461,6 +541,11 @@ impl<C: RenderCallback> App<C> {
             gpu: None,
             callback,
             last_present: None,
+            next_redraw_at: None,
+            redraw_in_flight: false,
+            occluded: false,
+            minimized: false,
+            wake_immediately: false,
             on_ready: None,
             initial_window: None,
             window_mode: WindowMode::default(),
@@ -488,26 +573,27 @@ impl<C: RenderCallback> App<C> {
         self
     }
 
-    /// Renders one frame: dark clear pass into the surface texture, then the render
-    /// callback composites on top. Returns `true` if a frame was actually presented.
-    fn render(&mut self) -> bool {
+    /// Renders one frame: optional shell clear pass into the surface texture, then the
+    /// render callback composites on top.
+    fn render(&mut self) -> RenderOutcome {
         let (Some(window), Some(gpu)) = (self.window.as_ref(), self.gpu.as_mut()) else {
-            return false;
+            return RenderOutcome::RetryLater;
         };
 
         let surface_texture = match gpu.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
             | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
-            // Surface needs reconfiguration; do it and try again next redraw.
+            // Surface needs reconfiguration; do it and retry after backoff.
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 let size = window.inner_size();
-                gpu.resize(size);
-                return false;
+                gpu.reconfigure(size);
+                return RenderOutcome::RetryLater;
             }
-            // Transient: skip this frame.
-            wgpu::CurrentSurfaceTexture::Timeout
-            | wgpu::CurrentSurfaceTexture::Occluded
-            | wgpu::CurrentSurfaceTexture::Validation => return false,
+            wgpu::CurrentSurfaceTexture::Occluded => return RenderOutcome::Occluded,
+            // Transient: skip this frame with backoff.
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Validation => {
+                return RenderOutcome::RetryLater;
+            }
         };
 
         let view = surface_texture
@@ -520,20 +606,19 @@ impl<C: RenderCallback> App<C> {
                 label: Some("viewmusic-frame"),
             });
 
-        // Clear pass FIRST — establishes the scene background (transparent when the
-        // callback requests it, opaque dark otherwise). The overlay/visualizer
-        // callback loads (LoadOp::Load) on top so the scene is never wiped (R2).
-        let clear_color = if self.callback.wants_transparent_clear() {
-            wgpu::Color::TRANSPARENT
-        } else {
-            wgpu::Color {
-                r: 0.02,
-                g: 0.02,
-                b: 0.03,
-                a: 1.0,
-            }
-        };
-        {
+        // Clear pass FIRST unless the callback owns clearing the surface itself
+        // (avoids an empty full-screen clear+store pass every frame on Active views).
+        if !self.callback.owns_surface_clear() {
+            let clear_color = if self.callback.wants_transparent_clear() {
+                wgpu::Color::TRANSPARENT
+            } else {
+                wgpu::Color {
+                    r: 0.02,
+                    g: 0.02,
+                    b: 0.03,
+                    a: 1.0,
+                }
+            };
             let _clear = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("clear-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -566,10 +651,11 @@ impl<C: RenderCallback> App<C> {
         }
 
         gpu.queue.submit(std::iter::once(encoder.finish()));
+        self.callback.on_post_submit();
         // Tell winit we are about to present so it can pace the next redraw.
         window.pre_present_notify();
         surface_texture.present();
-        true
+        RenderOutcome::Presented
     }
 }
 
@@ -642,6 +728,7 @@ impl<C: RenderCallback> ApplicationHandler for App<C> {
 
         self.gpu = Some(gpu);
         self.window = Some(window.clone());
+        self.redraw_in_flight = true;
         window.request_redraw();
     }
 
@@ -651,43 +738,117 @@ impl<C: RenderCallback> ApplicationHandler for App<C> {
         _window_id: WindowId,
         event: WindowEvent,
     ) {
-        // Let the overlay see the event first (input routing).
-        if let Some(window) = self.window.as_ref() {
-            let _consumed = self.callback.on_window_event(window, &event);
+        // Let the overlay see input/structural events (skip RedrawRequested, which
+        // neither VizApp nor egui_winit consumes).
+        if !matches!(event, WindowEvent::RedrawRequested) {
+            if let Some(window) = self.window.as_ref() {
+                let _consumed = self.callback.on_window_event(window, &event);
+            }
         }
 
         match event {
             WindowEvent::CloseRequested => {
                 event_loop.exit();
             }
-            WindowEvent::Resized(size) => {
-                if let Some(gpu) = self.gpu.as_mut() {
-                    gpu.resize(size);
+            WindowEvent::Occluded(occluded) => {
+                self.occluded = occluded;
+                if occluded {
+                    self.redraw_in_flight = false;
+                } else {
+                    self.wake_immediately = true;
                 }
-                if let Some(window) = self.window.as_ref() {
-                    window.request_redraw();
+            }
+            WindowEvent::Resized(size) => {
+                self.minimized = size.width == 0 || size.height == 0;
+                if self.minimized {
+                    self.redraw_in_flight = false;
+                } else {
+                    if let Some(gpu) = self.gpu.as_mut() {
+                        gpu.resize(size);
+                    }
+                    self.wake_immediately = true;
                 }
             }
             WindowEvent::ScaleFactorChanged { .. } => {
                 // Physical inner size already reflects the new scale; reconfigure.
                 if let (Some(gpu), Some(window)) = (self.gpu.as_mut(), self.window.as_ref()) {
                     gpu.resize(window.inner_size());
-                    window.request_redraw();
+                    self.wake_immediately = true;
                 }
             }
+            WindowEvent::CursorMoved { .. }
+            | WindowEvent::CursorEntered { .. }
+            | WindowEvent::CursorLeft { .. }
+            | WindowEvent::MouseInput { .. }
+            | WindowEvent::MouseWheel { .. }
+            | WindowEvent::KeyboardInput { .. }
+            | WindowEvent::ModifiersChanged(_)
+            | WindowEvent::Focused(true) => {
+                self.wake_immediately = true;
+            }
             WindowEvent::RedrawRequested => {
-                // Always schedule the next redraw so the loop stays alive (macOS
-                // display-link throttled). Pacing decides whether we present.
-                let now = Instant::now();
-                let present = should_present(now, self.last_present, MIN_FRAME_INTERVAL);
-                if present && self.render() {
-                    self.last_present = Some(now);
+                self.redraw_in_flight = false;
+                if self.occluded || self.minimized {
+                    return;
                 }
-                if let Some(window) = self.window.as_ref() {
-                    window.request_redraw();
+                let now = Instant::now();
+                let effective_interval = if self.wake_immediately {
+                    MIN_FRAME_INTERVAL
+                } else {
+                    self.callback
+                        .desired_frame_interval()
+                        .max(MIN_FRAME_INTERVAL)
+                };
+                if should_present(now, self.last_present, effective_interval) {
+                    self.wake_immediately = false;
+                    match self.render() {
+                        RenderOutcome::Presented => {
+                            self.last_present = Some(now);
+                            let next_interval = self
+                                .callback
+                                .desired_frame_interval()
+                                .max(MIN_FRAME_INTERVAL);
+                            self.next_redraw_at = Some(now + next_interval);
+                        }
+                        RenderOutcome::Occluded => {
+                            // Slow backoff instead of spinning if OS did not send Occluded(true).
+                            self.next_redraw_at = Some(now + Duration::from_millis(100));
+                        }
+                        RenderOutcome::RetryLater => {
+                            self.next_redraw_at = Some(now + MIN_FRAME_INTERVAL);
+                        }
+                    }
+                } else if let Some(prev) = self.last_present {
+                    self.next_redraw_at = Some(prev + effective_interval);
                 }
             }
             _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(window) = self.window.as_ref() else {
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        };
+        if self.occluded || self.minimized || self.redraw_in_flight {
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        }
+        let now = Instant::now();
+        let deadline = next_frame_deadline(
+            now,
+            self.last_present,
+            self.next_redraw_at,
+            self.callback.desired_frame_interval(),
+            self.wake_immediately,
+        );
+        if now >= deadline {
+            self.redraw_in_flight = true;
+            window.request_redraw();
+            event_loop.set_control_flow(ControlFlow::Wait);
+        } else {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
         }
     }
 }
@@ -875,5 +1036,36 @@ mod tests {
             }
         );
         assert_eq!(clamp_initial_window(normal, None), normal);
+    }
+
+    #[test]
+    fn next_frame_deadline_respects_pacing_backoff_and_wake() {
+        let now = Instant::now();
+        // First frame with no prior present is due immediately.
+        assert_eq!(
+            next_frame_deadline(now, None, None, MIN_FRAME_INTERVAL, false),
+            now
+        );
+        // Active 60 Hz frame schedules last_present + MIN_FRAME_INTERVAL.
+        assert_eq!(
+            next_frame_deadline(now, Some(now), None, MIN_FRAME_INTERVAL, false),
+            now + MIN_FRAME_INTERVAL
+        );
+        // Throttled 20 Hz silence interval waits 50 ms unless input wakes it.
+        let silent = Duration::from_millis(50);
+        assert_eq!(
+            next_frame_deadline(now, Some(now), None, silent, false),
+            now + silent
+        );
+        assert_eq!(
+            next_frame_deadline(now, Some(now), None, silent, true),
+            now + MIN_FRAME_INTERVAL
+        );
+        // Backoff after Occluded/RetryLater overrides shorter desired interval.
+        let backoff = now + Duration::from_millis(100);
+        assert_eq!(
+            next_frame_deadline(now, Some(now), Some(backoff), MIN_FRAME_INTERVAL, false),
+            backoff
+        );
     }
 }

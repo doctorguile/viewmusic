@@ -93,6 +93,9 @@ pub struct Overlay {
     /// `CursorLeft` / focus loss so synthesized pointer releases have a valid
     /// coordinate even when `egui-winit` cleared `pointer_pos_in_points`).
     last_valid_cursor_pos: egui::Pos2,
+    /// Cached pixels-per-point scale factor, updated on `attach` and
+    /// `ScaleFactorChanged` to avoid per-`CursorMoved` AppKit + egui RwLock queries.
+    scale_factor: f32,
 }
 
 impl Default for Overlay {
@@ -111,6 +114,7 @@ impl Overlay {
             ui: Box::new(default_ui),
             last_cursor_pos: None,
             last_valid_cursor_pos: egui::Pos2::ZERO,
+            scale_factor: 1.0,
         }
     }
 
@@ -135,11 +139,12 @@ impl Overlay {
         window: &Window,
         output_color_format: wgpu::TextureFormat,
     ) {
+        let scale = window.scale_factor() as f32;
         let state = State::new(
             self.ctx.clone(),
             self.ctx.viewport_id(),
             window,
-            Some(window.scale_factor() as f32),
+            Some(scale),
             None,
             // Bound texture uploads to the device limit (avoids oversized atlases).
             Some(device.limits().max_texture_dimension_2d as usize),
@@ -147,6 +152,29 @@ impl Overlay {
         let renderer = Renderer::new(device, output_color_format, RendererOptions::default());
         self.state = Some(state);
         self.renderer = Some(renderer);
+        self.scale_factor = scale.max(f32::EPSILON);
+    }
+
+    /// Lightweight cursor & scale tracking while the overlay is auto-hidden and
+    /// settled (avoids pushing events into `egui-winit`'s input buffer while
+    /// `Overlay::render` is bypassed).
+    pub fn on_hidden_window_event(&mut self, window: &Window, event: &WindowEvent) {
+        match event {
+            WindowEvent::ScaleFactorChanged { .. } => {
+                self.scale_factor =
+                    egui_winit::pixels_per_point(&self.ctx, window).max(f32::EPSILON);
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                let scale = self.scale_factor.max(f32::EPSILON);
+                let pos = egui::pos2(position.x as f32 / scale, position.y as f32 / scale);
+                self.last_cursor_pos = Some(pos);
+                self.last_valid_cursor_pos = pos;
+            }
+            WindowEvent::CursorLeft { .. } | WindowEvent::Focused(false) => {
+                self.last_cursor_pos = None;
+            }
+            _ => {}
+        }
     }
 
     /// Whether egui currently wants the pointer (it is over an overlay
@@ -225,8 +253,12 @@ fn default_ui(ctx: &egui::Context) {
 impl RenderCallback for Overlay {
     fn on_window_event(&mut self, window: &Window, event: &WindowEvent) -> bool {
         match event {
+            WindowEvent::ScaleFactorChanged { .. } => {
+                self.scale_factor =
+                    egui_winit::pixels_per_point(&self.ctx, window).max(f32::EPSILON);
+            }
             WindowEvent::CursorMoved { position, .. } => {
-                let scale = egui_winit::pixels_per_point(&self.ctx, window).max(f32::EPSILON);
+                let scale = self.scale_factor.max(f32::EPSILON);
                 let pos = egui::pos2(position.x as f32 / scale, position.y as f32 / scale);
                 self.last_cursor_pos = Some(pos);
                 self.last_valid_cursor_pos = pos;
@@ -347,7 +379,7 @@ impl RenderCallback for Overlay {
             return;
         };
 
-        let pixels_per_point = frame.window.scale_factor() as f32;
+        let pixels_per_point = self.scale_factor;
 
         // 1) Run the egui pass (immediate-mode panel rebuild). `run_ui` hands a root
         //    `Ui`; our overlay panels are free-floating `Window`s anchored to the
@@ -388,21 +420,23 @@ impl RenderCallback for Overlay {
             renderer.update_texture(frame.device, frame.queue, *id, image_delta);
         }
 
-        // 5) Stage vertex/index buffers (records onto our encoder; no extra submit).
-        let user_buffers = renderer.update_buffers(
-            frame.device,
-            frame.queue,
-            frame.encoder,
-            &paint_jobs,
-            &screen_descriptor,
-        );
-        debug_assert!(
-            user_buffers.is_empty(),
-            "no user paint callbacks expected in the overlay"
-        );
+        // 5–6) Stage buffers and open the overlay pass ONLY when there are clipped
+        // primitives to paint (skips uniform upload + empty Metal render pass on
+        // auto-hidden frames).
+        if !paint_jobs.is_empty() {
+            let user_buffers = renderer.update_buffers(
+                frame.device,
+                frame.queue,
+                frame.encoder,
+                &paint_jobs,
+                &screen_descriptor,
+            );
+            debug_assert!(
+                user_buffers.is_empty(),
+                "no user paint callbacks expected in the overlay"
+            );
 
-        // 6) Paint on TOP of the existing scene: LoadOp::Load never clears it (R2).
-        {
+            // Paint on TOP of the existing scene: LoadOp::Load never clears it (R2).
             let render_pass = frame
                 .encoder
                 .begin_render_pass(&wgpu::RenderPassDescriptor {

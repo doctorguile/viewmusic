@@ -165,8 +165,10 @@ impl std::error::Error for CaptureError {}
 /// the Windows backend reads the device channel count from the mix format.
 #[cfg(target_os = "macos")]
 const TAP_CHANNELS: usize = 2;
-/// Requested device buffer size in frames (small enough to keep latency low).
-pub const REQUESTED_BUFFER_FRAMES: u32 = 128;
+/// Requested device buffer size in frames. Matches `dsp::HOP_SIZE` (512 frames =
+/// 10.67 ms at 48 kHz) so Core Audio wakes at 93.75 Hz instead of 375 Hz with zero
+/// added analysis latency.
+pub const REQUESTED_BUFFER_FRAMES: u32 = 512;
 
 // ---------------------------------------------------------------------------
 // macOS backend (cidre). Isolated behind cfg so non-macOS builds still compile.
@@ -381,19 +383,20 @@ mod macos {
         let frames = total_floats / channels;
         let frames = frames.min(ctx.mono.len());
 
-        if channels >= TAP_CHANNELS {
+        if channels == TAP_CHANNELS {
+            // Fast path for stereo (auto-vectorizable L+R de-interleave).
+            for (dst, pair) in ctx.mono[..frames].iter_mut().zip(samples.chunks_exact(2)) {
+                *dst = 0.5 * (pair[0] + pair[1]);
+            }
+        } else if channels > TAP_CHANNELS {
             // Mix L+R (first two channels) → mono = 0.5*(L+R).
-            for i in 0..frames {
+            for (i, dst) in ctx.mono[..frames].iter_mut().enumerate() {
                 let base = i * channels;
-                let l = samples[base];
-                let r = samples[base + 1];
-                ctx.mono[i] = 0.5 * (l + r);
+                *dst = 0.5 * (samples[base] + samples[base + 1]);
             }
         } else {
-            // Mono source: copy through.
-            for i in 0..frames {
-                ctx.mono[i] = samples[i * channels];
-            }
+            // Mono source: direct copy.
+            ctx.mono[..frames].copy_from_slice(&samples[..frames]);
         }
         ctx.sink.push(&ctx.mono[..frames]);
         cidre::os::Status::NO_ERR

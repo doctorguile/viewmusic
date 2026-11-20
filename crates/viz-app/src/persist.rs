@@ -340,21 +340,26 @@ fn parse_hex_color(s: &str) -> Option<(f64, f64, f64, f64)> {
 /// macOS, `%APPDATA%\acrive82\viewmusic\config\artifacts\` on Windows.
 const ARTIFACTS_SUBDIR: &str = "artifacts";
 
-/// Resolves the project config directory, creating it if needed. `None` if the
-/// platform yields no home/config dir or the directory cannot be created.
+/// Resolves the project config directory, creating it if needed. Cached once per
+/// process so debounced saves avoid repeated `ProjectDirs` / `create_dir_all` syscalls.
 fn config_dir() -> Option<PathBuf> {
-    let dirs = directories::ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)?;
-    let dir = dirs.config_dir().to_path_buf();
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        tracing::warn!(
-            target: "viz_app::persist",
-            dir = %dir.display(),
-            error = %e,
-            "could not create config directory; persistence disabled this run"
-        );
-        return None;
-    }
-    Some(dir)
+    static CONFIG_DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    CONFIG_DIR
+        .get_or_init(|| {
+            let dirs = directories::ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)?;
+            let dir = dirs.config_dir().to_path_buf();
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                tracing::warn!(
+                    target: "viz_app::persist",
+                    dir = %dir.display(),
+                    error = %e,
+                    "could not create config directory; persistence disabled this run"
+                );
+                return None;
+            }
+            Some(dir)
+        })
+        .clone()
 }
 
 /// Resolves the user artifacts folder, **creating it if missing**, and returns its

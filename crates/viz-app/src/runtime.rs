@@ -4,37 +4,26 @@
 //! this implements.
 //!
 //! An [`ArtifactRuntime`] owns one reusable [`viz_expr::Vm`] (sized to the
-//! artifact's `slot_count`) plus staging buffers pre-allocated to the contract
-//! maxima ([`viz_render::MAX_INSTANCES`] / [`viz_render::MAX_POINTS`] /
-//! [`viz_render::MAX_FIELD_CELLS`]). After construction the hot path
-//! ([`ArtifactRuntime::frame`]) performs **no heap allocation** beyond the tiny,
-//! bounded `Vec<LayerDraw>` describing ≤16 layers — every per-element write goes
-//! into the pre-allocated staging slices (the render loop must not allocate in
-//! steady state).
+//! artifact's `slot_count`), per-layer multi-output LICM + CSE [`MultiProgram`]s,
+//! and staging buffers pre-allocated to the contract maxima
+//! ([`viz_render::MAX_INSTANCES`] / [`viz_render::MAX_POINTS`] /
+//! [`viz_render::MAX_FIELD_CELLS`]).
 //!
 //! ## Determinism (see `docs/reference/artifact-contract.md` §9)
 //! The output is a pure function of the supplied `(FeatureFrame, dt, aspect)`
 //! sequence and the setting values. There is no wall-clock read and no
 //! `HashMap`-order iteration anywhere on the eval path: vars and settings are
 //! visited in [`IndexMap`](indexmap::IndexMap) declaration order, layers in
-//! `scene` array order. The var read-semantics of contract §5 fall out of writing
-//! each var's current-frame value into its slot **immediately** after evaluating
-//! it, in declaration order (update-in-place): an earlier var reads its updated
-//! value, a later var (or the var itself) reads last frame's value.
-//!
-//! ## Stage extras
-//! Per element/point the runtime writes `i`, `n`, `u`; per field cell it writes
-//! `x`, `y`, `i`, `n` (cell centers, row-major from bottom-left). These map onto
-//! the named [`SlotLayout`] fields the loader published.
+//! `scene` array order.
 
 use indexmap::IndexMap;
 
 use viz_contract::{
-    Blend, ColorModel, ColorPrograms, CompiledFormula, Layer, LayerPrograms, LoadedArtifact,
+    Blend, ColorModel, ColorSpec, CompiledFormula, Formula, Layer, LayerPrograms, LoadedArtifact,
     SettingSlots, Shape,
 };
 use viz_core::FeatureFrame;
-use viz_expr::Vm;
+use viz_expr::{compile_multi, MultiInput, MultiProgram, Vm, MAX_MULTI_OUTS};
 use viz_render::{
     BlendMode, InstanceData, LayerDraw, PointData, SceneParams, ShapeKind, MAX_FIELD_CELLS,
     MAX_FIELD_RES, MAX_INSTANCES, MAX_POINTS,
@@ -55,11 +44,6 @@ const DECAY_MAX: f32 = 0.99;
 
 /// The live value of one setting, applied to the VM's setting slots at
 /// [`ArtifactRuntime::activate`] and whenever the UI mutates it.
-///
-/// Stored per the [`SettingSlots`] layout so the runtime never re-parses the
-/// declaration on the hot path. Number/toggle/choice collapse to a single scalar
-/// (number value, `0.0`/`1.0`, 0-based choice index — contract §4); color carries
-/// four straight-alpha channels in `0..1`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SettingValue {
     /// A `number`, `toggle`, or `choice` setting as one scalar.
@@ -78,8 +62,7 @@ pub enum SettingValue {
 }
 
 /// Per-layer draw metadata recorded each frame, used to build the borrowed
-/// [`LayerDraw`] list in [`SceneOut`]. Holds the resolved length / shape / blend /
-/// thickness so the borrow view is a cheap projection over the staging slices.
+/// [`LayerDraw`] list in [`SceneOut`].
 #[derive(Clone, Copy, Debug)]
 enum LayerSlot {
     /// `instanced`: `len` instances starting at `offset` in the instance staging.
@@ -108,14 +91,31 @@ enum LayerSlot {
 }
 
 /// One frame's renderable scene, borrowing the runtime's staging buffers.
-///
-/// The `layers` are in `scene` order (painter's algorithm); pass them straight to
-/// [`viz_render::Renderer::render`] together with [`SceneOut::params`].
 pub struct SceneOut<'a> {
     /// Scene-wide parameters (feedback decay).
     pub params: SceneParams,
     /// Per-layer draw lists, borrowing the staging slices. Bounded by ≤16 layers.
     pub layers: Vec<LayerDraw<'a>>,
+}
+
+/// Precomputed per-layer compiled multi-output program with LICM + cross-formula CSE
+/// (built once in [`ArtifactRuntime::new`]).
+#[derive(Clone, Debug)]
+struct CompiledLayer {
+    prog: MultiProgram,
+    reads_i: bool,
+    reads_n: bool,
+    reads_u: bool,
+    reads_x: bool,
+    reads_y: bool,
+    color_model: ColorModel,
+    /// True if all 4 color channels are frame-invariant (so `pack_color` + HSV→RGB
+    /// runs once per layer instead of once per element/point).
+    color_frame_invariant: bool,
+    /// True if all outputs of a Field layer are frame-invariant (`item_ops` & `row_ops` empty).
+    all_frame_invariant: bool,
+    /// True if a Field layer varies only by row (`item_ops` empty, `row_ops` non-empty).
+    row_only: bool,
 }
 
 /// The deterministic per-frame evaluator for one [`LoadedArtifact`].
@@ -129,6 +129,10 @@ pub struct ArtifactRuntime {
     vm: Vm,
     /// Live setting values in `layout.settings` declaration order.
     settings: IndexMap<String, SettingValue>,
+    /// Per-layer multi-output LICM + CSE programs (matches `art.programs.layers`).
+    compiled_layers: Vec<CompiledLayer>,
+    /// Reusable scratch table for `Field` x-only hoisted column values (`res * num_col`).
+    col_scratch: Vec<f64>,
 
     /// Pre-allocated instance staging (capacity [`MAX_INSTANCES`]).
     instances: Vec<InstanceData>,
@@ -150,6 +154,12 @@ impl ArtifactRuntime {
     pub fn new(art: LoadedArtifact) -> Self {
         let vm = Vm::new(art.layout.slot_count, art.seed);
         let settings = default_setting_values(&art);
+        let compiled_layers = build_compiled_layers(&art);
+        let max_col = compiled_layers
+            .iter()
+            .map(|c| c.prog.num_col())
+            .max()
+            .unwrap_or(0);
 
         let mut instances = Vec::new();
         instances.reserve_exact(MAX_INSTANCES);
@@ -159,17 +169,22 @@ impl ArtifactRuntime {
         cells.reserve_exact(MAX_FIELD_CELLS);
         let mut layer_slots = Vec::new();
         layer_slots.reserve_exact(art.programs.layers.len());
+        let col_scratch = vec![0.0f64; max_col * MAX_FIELD_RES as usize];
 
-        Self {
+        let mut rt = Self {
             art,
             vm,
             settings,
+            compiled_layers,
+            col_scratch,
             instances,
             points,
             cells,
             layer_slots,
             feedback_decay: None,
-        }
+        };
+        rt.write_settings();
+        rt
     }
 
     /// The artifact's id, for logging / persistence keys.
@@ -183,12 +198,9 @@ impl ArtifactRuntime {
     }
 
     /// Sets one setting by name to `value` (a live UI edit). Returns `false`
-    /// if the name is unknown or the value kind mismatches the setting's kind
-    /// (scalar vs color). The new value is written into the VM slot(s) before the
-    /// next [`ArtifactRuntime::frame`], so the edit is visible on that frame — there
-    /// is no deferred queue, so an edit takes effect on the very next frame.
+    /// if the name is unknown or the value kind mismatches the setting's kind.
     pub fn set_setting(&mut self, name: &str, value: SettingValue) -> bool {
-        match self.settings.get_mut(name) {
+        let updated = match self.settings.get_mut(name) {
             Some(slot @ SettingValue::Scalar(_)) if matches!(value, SettingValue::Scalar(_)) => {
                 *slot = value;
                 true
@@ -200,19 +212,21 @@ impl ArtifactRuntime {
                 true
             }
             _ => false,
+        };
+        if updated {
+            if let Some(&slots) = self.art.layout.settings.get(name) {
+                write_one_setting(&mut self.vm, slots, value);
+            }
         }
+        updated
     }
 
-    /// Sets a scalar setting (`number`/`toggle`/`choice`) by name. Returns `false`
-    /// if the name is unknown or names a color setting. Convenience over
-    /// [`ArtifactRuntime::set_setting`].
+    /// Sets a scalar setting (`number`/`toggle`/`choice`) by name.
     pub fn set_setting_scalar(&mut self, name: &str, value: f64) -> bool {
         self.set_setting(name, SettingValue::Scalar(value))
     }
 
-    /// Sets a `color` setting by name (channels in `0..1`). Returns `false` if the
-    /// name is unknown or names a scalar setting. Convenience over
-    /// [`ArtifactRuntime::set_setting`].
+    /// Sets a `color` setting by name (channels in `0..1`).
     pub fn set_setting_color(&mut self, name: &str, r: f64, g: f64, b: f64, a: f64) -> bool {
         self.set_setting(name, SettingValue::Color { r, g, b, a })
     }
@@ -226,12 +240,8 @@ impl ArtifactRuntime {
 
     /// Writes the current setting values into their VM slots and runs every
     /// `vars.init` program in declaration order, seeding each var's slot.
-    ///
-    /// Call once after [`ArtifactRuntime::new`] (and on settings reset). Does not
-    /// depend on a feature frame: `init` formulas read settings/constants only.
     pub fn activate(&mut self) {
         self.write_settings();
-        // Clear any stale shared/extra slots so `init` sees a clean, zeroed frame.
         self.vm.set_frame(&FeatureFrame::default());
         let layout = &self.art.layout;
         for (idx, slot) in layout.vars.values().enumerate() {
@@ -241,12 +251,6 @@ impl ArtifactRuntime {
     }
 
     /// Evaluates one frame and returns the renderable [`SceneOut`].
-    ///
-    /// `feature` supplies the audio inputs and `band()`/`wave()`; `dt` is the
-    /// audio-clock delta (seconds); `aspect` is render width/height; `detail_factor`
-    /// (0..1, from [`viz_render::DegradeController`]) scales element/point/cell
-    /// counts for graceful degradation under load — counts never drop below their
-    /// contract minimum.
     pub fn frame(
         &mut self,
         feature: &FeatureFrame,
@@ -268,9 +272,6 @@ impl ArtifactRuntime {
         self.vm.set_slot(layout.aspect, aspect as f64);
         self.vm.set_frame(feature);
 
-        // Settings can change between frames; re-apply them each frame.
-        self.write_settings();
-
         // 2) Vars, IN DECLARATION ORDER, update-in-place (contract §5 semantics).
         for (idx, slot) in self.art.layout.vars.values().enumerate() {
             let v = self.art.programs.vars_frame[idx].value(&mut self.vm);
@@ -284,10 +285,6 @@ impl ArtifactRuntime {
         self.layer_slots.clear();
 
         let detail = detail_factor.clamp(0.0, 1.0) as f64;
-
-        // Borrow-split: the program/scene metadata is read-only, the VM + staging
-        // are written. We index by position to avoid holding an iterator borrow on
-        // `self.art` while mutating `self.vm`/staging.
         let n_layers = self.art.programs.layers.len();
         for li in 0..n_layers {
             let slot = self.eval_layer(li, detail);
@@ -303,9 +300,7 @@ impl ArtifactRuntime {
         self.build_scene_out()
     }
 
-    /// Renders this frame's idle/clear scene: no layers, no trails. Used when the
-    /// degrade ladder has paused element evaluation under load — the renderer still
-    /// clears the surface so the window is never black/garbage.
+    /// Renders this frame's idle/clear scene: no layers, no trails.
     pub fn idle_scene(&mut self) -> SceneOut<'_> {
         self.instances.clear();
         self.points.clear();
@@ -321,8 +316,7 @@ impl ArtifactRuntime {
         }
     }
 
-    /// Whether this artifact requests feedback/trails at all (so the host can let
-    /// the degrade controller shed it first when shedding load).
+    /// Whether this artifact requests feedback/trails at all.
     #[allow(dead_code)]
     pub fn has_feedback(&self) -> bool {
         self.art.programs.feedback_decay.is_some()
@@ -333,58 +327,25 @@ impl ArtifactRuntime {
     /// Writes each live setting value into its VM slot(s).
     fn write_settings(&mut self) {
         for (name, value) in &self.settings {
-            // The slot layout and the live values share declaration order + keys.
-            let Some(slots) = self.art.layout.settings.get(name) else {
+            let Some(&slots) = self.art.layout.settings.get(name) else {
                 continue;
             };
-            match (*slots, *value) {
-                (SettingSlots::Scalar(s), SettingValue::Scalar(v)) => {
-                    self.vm.set_slot(s, v);
-                }
-                (
-                    SettingSlots::Color { r, g, b, a },
-                    SettingValue::Color {
-                        r: vr,
-                        g: vg,
-                        b: vb,
-                        a: va,
-                    },
-                ) => {
-                    self.vm.set_slot(r, vr);
-                    self.vm.set_slot(g, vg);
-                    self.vm.set_slot(b, vb);
-                    self.vm.set_slot(a, va);
-                }
-                // Layout/value kind mismatch cannot happen (both built from the
-                // same decls), but ignore defensively rather than panic.
-                _ => {}
-            }
+            write_one_setting(&mut self.vm, slots, *value);
         }
     }
 
     /// Evaluates one layer (`li`) into staging, returning its draw metadata.
     fn eval_layer(&mut self, li: usize, detail: f64) -> LayerSlot {
-        // The named slot ids are `Copy`, so capture the ones the loop needs up
-        // front — this releases the immutable borrow on `self.art.layout` so the
-        // per-element loop can mutate `self.vm` and the staging buffers.
         let (s_i, s_n, s_u, s_x, s_y) = {
             let l = &self.art.layout;
             (l.i, l.n, l.u, l.x, l.y)
         };
-        // `shape`/`blend`/`closed` live in the typed scene, not in LayerPrograms;
-        // the loader builds both in the same order, so index `li` matches.
         let scene_layer = &self.art.artifact.scene[li];
+        let cl = &self.compiled_layers[li];
+        let mut outs = [0.0f64; MAX_MULTI_OUTS];
+
         match &self.art.programs.layers[li] {
-            LayerPrograms::Instanced {
-                count,
-                visible,
-                x,
-                y,
-                w,
-                h,
-                rot,
-                color,
-            } => {
+            LayerPrograms::Instanced { count, visible, .. } => {
                 if !visible_passes(visible, &mut self.vm) {
                     return LayerSlot::Skipped;
                 }
@@ -392,25 +353,50 @@ impl ArtifactRuntime {
                 let n = scale_count(raw, INSTANCE_MIN, MAX_INSTANCES, detail);
                 let offset = self.instances.len();
                 let denom = (n.saturating_sub(1)).max(1) as f64;
-                for i in 0..n {
-                    self.vm.set_slot(s_i, i as f64);
+                let inv_denom = 1.0 / denom;
+
+                if cl.reads_n {
                     self.vm.set_slot(s_n, n as f64);
-                    self.vm.set_slot(s_u, i as f64 / denom);
-                    let px = x.value(&mut self.vm) as f32;
-                    let py = y.value(&mut self.vm) as f32;
-                    let pw = w.value(&mut self.vm) as f32;
-                    let ph = h.value(&mut self.vm) as f32;
-                    let prot = rot
-                        .as_ref()
-                        .map(|p| p.value(&mut self.vm) as f32)
-                        .unwrap_or(0.0);
-                    let col = eval_color(color, &mut self.vm);
+                }
+                self.vm.eval_multi_hoisted(&cl.prog, &mut outs);
+
+                let hoisted_col = if cl.color_frame_invariant {
+                    pack_color(
+                        cl.color_model,
+                        outs[5],
+                        outs[6],
+                        outs[7],
+                        outs[8].clamp(0.0, 1.0) as f32,
+                    )
+                } else {
+                    [0.0; 4]
+                };
+
+                for i in 0..n {
+                    if cl.reads_i {
+                        self.vm.set_slot(s_i, i as f64);
+                    }
+                    if cl.reads_u {
+                        self.vm.set_slot(s_u, i as f64 * inv_denom);
+                    }
+                    self.vm.eval_multi_item(&cl.prog, &mut outs);
+                    let col = if cl.color_frame_invariant {
+                        hoisted_col
+                    } else {
+                        pack_color(
+                            cl.color_model,
+                            outs[5],
+                            outs[6],
+                            outs[7],
+                            outs[8].clamp(0.0, 1.0) as f32,
+                        )
+                    };
                     self.instances.push(InstanceData {
-                        x: px,
-                        y: py,
-                        w: pw,
-                        h: ph,
-                        rot: prot,
+                        x: outs[0] as f32,
+                        y: outs[1] as f32,
+                        w: outs[2] as f32,
+                        h: outs[3] as f32,
+                        rot: outs[4] as f32,
                         color: col,
                     });
                 }
@@ -425,10 +411,8 @@ impl ArtifactRuntime {
                 points,
                 thickness,
                 visible,
-                x,
-                y,
-                color,
                 closed,
+                ..
             } => {
                 if !visible_passes(visible, &mut self.vm) {
                     return LayerSlot::Skipped;
@@ -439,16 +423,47 @@ impl ArtifactRuntime {
                     (thickness.value(&mut self.vm) as f32).clamp(THICKNESS_MIN, THICKNESS_MAX);
                 let offset = self.points.len();
                 let denom = (n.saturating_sub(1)).max(1) as f64;
-                for i in 0..n {
-                    self.vm.set_slot(s_i, i as f64);
+                let inv_denom = 1.0 / denom;
+
+                if cl.reads_n {
                     self.vm.set_slot(s_n, n as f64);
-                    self.vm.set_slot(s_u, i as f64 / denom);
-                    let px = x.value(&mut self.vm) as f32;
-                    let py = y.value(&mut self.vm) as f32;
-                    let col = eval_color(color, &mut self.vm);
+                }
+                self.vm.eval_multi_hoisted(&cl.prog, &mut outs);
+
+                let hoisted_col = if cl.color_frame_invariant {
+                    pack_color(
+                        cl.color_model,
+                        outs[2],
+                        outs[3],
+                        outs[4],
+                        outs[5].clamp(0.0, 1.0) as f32,
+                    )
+                } else {
+                    [0.0; 4]
+                };
+
+                for i in 0..n {
+                    if cl.reads_i {
+                        self.vm.set_slot(s_i, i as f64);
+                    }
+                    if cl.reads_u {
+                        self.vm.set_slot(s_u, i as f64 * inv_denom);
+                    }
+                    self.vm.eval_multi_item(&cl.prog, &mut outs);
+                    let col = if cl.color_frame_invariant {
+                        hoisted_col
+                    } else {
+                        pack_color(
+                            cl.color_model,
+                            outs[2],
+                            outs[3],
+                            outs[4],
+                            outs[5].clamp(0.0, 1.0) as f32,
+                        )
+                    };
                     self.points.push(PointData {
-                        x: px,
-                        y: py,
+                        x: outs[0] as f32,
+                        y: outs[1] as f32,
                         color: col,
                     });
                 }
@@ -463,31 +478,102 @@ impl ArtifactRuntime {
             LayerPrograms::Field {
                 resolution,
                 visible,
-                color,
+                ..
             } => {
                 if !visible_passes(visible, &mut self.vm) {
                     return LayerSlot::Skipped;
                 }
                 let raw = resolution.value(&mut self.vm);
                 let res = scale_resolution(raw, detail);
+                let res_usize = res as usize;
                 let offset = self.cells.len();
-                let total = (res * res) as usize;
-                let n = total as f64;
-                // Cells iterate row-major from bottom-left (contract §6.3): the
-                // cell center maps to NDC −1..1 with y up. For res cells per axis,
-                // cell (col,row) center = (-1 + (col+0.5)*2/res, -1 + (row+0.5)*2/res).
+                let total = res_usize * res_usize;
+
+                if cl.reads_n {
+                    self.vm.set_slot(s_n, total as f64);
+                }
+                self.vm.eval_multi_hoisted(&cl.prog, &mut outs);
+
+                if cl.all_frame_invariant {
+                    let c = pack_color(
+                        cl.color_model,
+                        outs[0],
+                        outs[1],
+                        outs[2],
+                        outs[3].clamp(0.0, 1.0) as f32,
+                    );
+                    self.cells.resize(offset + total, c);
+                    return LayerSlot::Field {
+                        offset,
+                        resolution: res,
+                        blend: blend_mode(scene_layer),
+                    };
+                }
+
                 let inv = 2.0 / res as f64;
+
+                if cl.row_only {
+                    for row in 0..res {
+                        let cy = -1.0 + (row as f64 + 0.5) * inv;
+                        self.vm.set_slot(s_y, cy);
+                        self.vm.eval_multi_row(&cl.prog, &mut outs);
+                        let c = pack_color(
+                            cl.color_model,
+                            outs[0],
+                            outs[1],
+                            outs[2],
+                            outs[3].clamp(0.0, 1.0) as f32,
+                        );
+                        let next_len = self.cells.len() + res_usize;
+                        self.cells.resize(next_len, c);
+                    }
+                    return LayerSlot::Field {
+                        offset,
+                        resolution: res,
+                        blend: blend_mode(scene_layer),
+                    };
+                }
+
+                // Pre-evaluate `x`-only hoisted subexpressions once per column (`res`× instead
+                // of `res²`× — e.g. cuts 4 of 5 trig calls in `color-field` by 64×).
+                let num_col = cl.prog.num_col();
+                if num_col > 0 {
+                    for col in 0..res_usize {
+                        let cx = -1.0 + (col as f64 + 0.5) * inv;
+                        self.vm.set_slot(s_x, cx);
+                        let dst = &mut self.col_scratch[col * num_col..(col + 1) * num_col];
+                        self.vm.eval_multi_col(&cl.prog, dst);
+                    }
+                }
+
                 let mut idx = 0usize;
                 for row in 0..res {
                     let cy = -1.0 + (row as f64 + 0.5) * inv;
-                    for col in 0..res {
-                        let cx = -1.0 + (col as f64 + 0.5) * inv;
-                        self.vm.set_slot(s_x, cx);
+                    if cl.reads_y {
                         self.vm.set_slot(s_y, cy);
-                        self.vm.set_slot(s_i, idx as f64);
-                        self.vm.set_slot(s_n, n);
-                        let c = eval_color(color, &mut self.vm);
-                        self.cells.push(c);
+                    }
+                    self.vm.eval_multi_row(&cl.prog, &mut outs);
+
+                    for col in 0..res_usize {
+                        if cl.reads_x {
+                            let cx = -1.0 + (col as f64 + 0.5) * inv;
+                            self.vm.set_slot(s_x, cx);
+                        }
+                        if cl.reads_i {
+                            self.vm.set_slot(s_i, idx as f64);
+                        }
+                        if num_col > 0 {
+                            let src = &self.col_scratch[col * num_col..(col + 1) * num_col];
+                            self.vm.load_multi_col(&cl.prog, src);
+                        }
+                        self.vm.eval_multi_item(&cl.prog, &mut outs);
+                        self.cells.push(pack_color(
+                            cl.color_model,
+                            outs[0],
+                            outs[1],
+                            outs[2],
+                            outs[3].clamp(0.0, 1.0) as f32,
+                        ));
                         idx += 1;
                     }
                 }
@@ -556,20 +642,178 @@ impl ArtifactRuntime {
     }
 }
 
-/// Evaluates a [`ColorPrograms`] into a straight-alpha RGBA `[f32;4]`, clamped to
-/// the documented ranges (contract §7). HSVA is converted to RGBA; alpha defaults
-/// to 1 when omitted.
-fn eval_color(color: &ColorPrograms, vm: &mut Vm) -> [f32; 4] {
-    let c0 = color.c0.value(vm);
-    let c1 = color.c1.value(vm);
-    let c2 = color.c2.value(vm);
-    let a = color
-        .a
-        .as_ref()
-        .map(|p| p.value(vm))
-        .unwrap_or(1.0)
-        .clamp(0.0, 1.0) as f32;
-    match color.model {
+/// Writes one setting's value directly into its VM slot(s).
+#[inline]
+fn write_one_setting(vm: &mut Vm, slots: SettingSlots, value: SettingValue) {
+    match (slots, value) {
+        (SettingSlots::Scalar(s), SettingValue::Scalar(v)) => {
+            vm.set_slot(s, v);
+        }
+        (
+            SettingSlots::Color { r, g, b, a },
+            SettingValue::Color {
+                r: vr,
+                g: vg,
+                b: vb,
+                a: va,
+            },
+        ) => {
+            vm.set_slot(r, vr);
+            vm.set_slot(g, vg);
+            vm.set_slot(b, vb);
+            vm.set_slot(a, va);
+        }
+        _ => {}
+    }
+}
+
+fn formula_to_input(f: &Formula) -> MultiInput<'_> {
+    match f.as_expr_or_const() {
+        Err(v) => MultiInput::Const(v),
+        Ok(s) => MultiInput::Expr(s),
+    }
+}
+
+fn color_spec_inputs(color: &ColorSpec) -> (ColorModel, [MultiInput<'_>; 4]) {
+    match color {
+        ColorSpec::Rgba { r, g, b, a } => (
+            ColorModel::Rgba,
+            [
+                formula_to_input(r),
+                formula_to_input(g),
+                formula_to_input(b),
+                a.as_ref()
+                    .map(formula_to_input)
+                    .unwrap_or(MultiInput::Const(1.0)),
+            ],
+        ),
+        ColorSpec::Hsva { h, s, v, a } => (
+            ColorModel::Hsva,
+            [
+                formula_to_input(h),
+                formula_to_input(s),
+                formula_to_input(v),
+                a.as_ref()
+                    .map(formula_to_input)
+                    .unwrap_or(MultiInput::Const(1.0)),
+            ],
+        ),
+    }
+}
+
+/// Compiles every layer's per-item formulas into a single multi-output [`MultiProgram`]
+/// with LICM (frame / row / col hoisting) and cross-formula CSE.
+fn build_compiled_layers(art: &LoadedArtifact) -> Vec<CompiledLayer> {
+    let scope = art.layout.to_scope();
+    let l = &art.layout;
+    let elem_item_slots = [l.i, l.u];
+    let field_item_slots = [l.i];
+
+    art.artifact
+        .scene
+        .iter()
+        .zip(&art.programs.layers)
+        .map(|(layer, layer_progs)| match (layer, layer_progs) {
+            (Layer::Instanced { element, .. }, LayerPrograms::Instanced { color, .. }) => {
+                let (color_model, [c0, c1, c2, a]) = color_spec_inputs(&element.color);
+                let inputs = [
+                    formula_to_input(&element.x),
+                    formula_to_input(&element.y),
+                    formula_to_input(&element.w),
+                    formula_to_input(&element.h),
+                    element
+                        .rot
+                        .as_ref()
+                        .map(formula_to_input)
+                        .unwrap_or(MultiInput::Const(0.0)),
+                    c0,
+                    c1,
+                    c2,
+                    a,
+                ];
+                let prog = compile_multi(&inputs, &scope, &elem_item_slots, None, None)
+                    .expect("validated artifact formulas always compile");
+                let color_frame_invariant = !color.c0.reads_any_slot(&elem_item_slots)
+                    && !color.c1.reads_any_slot(&elem_item_slots)
+                    && !color.c2.reads_any_slot(&elem_item_slots)
+                    && !color
+                        .a
+                        .as_ref()
+                        .is_some_and(|f| f.reads_any_slot(&elem_item_slots));
+                CompiledLayer {
+                    reads_i: prog.reads_slot(l.i),
+                    reads_n: prog.reads_slot(l.n),
+                    reads_u: prog.reads_slot(l.u),
+                    reads_x: false,
+                    reads_y: false,
+                    color_model,
+                    color_frame_invariant,
+                    all_frame_invariant: prog.item_ops_empty(),
+                    row_only: false,
+                    prog,
+                }
+            }
+            (Layer::Polyline { point, .. }, LayerPrograms::Polyline { color, .. }) => {
+                let (color_model, [c0, c1, c2, a]) = color_spec_inputs(&point.color);
+                let inputs = [
+                    formula_to_input(&point.x),
+                    formula_to_input(&point.y),
+                    c0,
+                    c1,
+                    c2,
+                    a,
+                ];
+                let prog = compile_multi(&inputs, &scope, &elem_item_slots, None, None)
+                    .expect("validated artifact formulas always compile");
+                let color_frame_invariant = !color.c0.reads_any_slot(&elem_item_slots)
+                    && !color.c1.reads_any_slot(&elem_item_slots)
+                    && !color.c2.reads_any_slot(&elem_item_slots)
+                    && !color
+                        .a
+                        .as_ref()
+                        .is_some_and(|f| f.reads_any_slot(&elem_item_slots));
+                CompiledLayer {
+                    reads_i: prog.reads_slot(l.i),
+                    reads_n: prog.reads_slot(l.n),
+                    reads_u: prog.reads_slot(l.u),
+                    reads_x: false,
+                    reads_y: false,
+                    color_model,
+                    color_frame_invariant,
+                    all_frame_invariant: prog.item_ops_empty(),
+                    row_only: false,
+                    prog,
+                }
+            }
+            (Layer::Field { cell, .. }, LayerPrograms::Field { .. }) => {
+                let (color_model, inputs) = color_spec_inputs(&cell.color);
+                let prog = compile_multi(&inputs, &scope, &field_item_slots, Some(l.y), Some(l.x))
+                    .expect("validated artifact formulas always compile");
+                let all_frame_invariant =
+                    prog.item_ops_empty() && !prog.has_row_ops() && !prog.has_col_ops();
+                let row_only = prog.item_ops_empty() && prog.has_row_ops() && !prog.has_col_ops();
+                CompiledLayer {
+                    reads_i: prog.reads_slot(l.i),
+                    reads_n: prog.reads_slot(l.n),
+                    reads_u: false,
+                    reads_x: prog.reads_slot(l.x),
+                    reads_y: prog.reads_slot(l.y),
+                    color_model,
+                    color_frame_invariant: all_frame_invariant,
+                    all_frame_invariant,
+                    row_only,
+                    prog,
+                }
+            }
+            _ => unreachable!("scene layers and compiled layer programs always match"),
+        })
+        .collect()
+}
+
+/// Packs evaluated channel scalars into a straight-alpha RGBA `[f32; 4]`.
+#[inline]
+fn pack_color(model: ColorModel, c0: f64, c1: f64, c2: f64, a: f32) -> [f32; 4] {
+    match model {
         ColorModel::Rgba => [
             c0.clamp(0.0, 1.0) as f32,
             c1.clamp(0.0, 1.0) as f32,
@@ -577,35 +821,32 @@ fn eval_color(color: &ColorPrograms, vm: &mut Vm) -> [f32; 4] {
             a,
         ],
         ColorModel::Hsva => {
-            // Hue wraps mod 360; saturation/value clamp 0..1.
-            let h = c0.rem_euclid(360.0);
-            let s = c1.clamp(0.0, 1.0);
-            let v = c2.clamp(0.0, 1.0);
-            let (r, g, b) = hsv_to_rgb(h, s, v);
-            [r as f32, g as f32, b as f32, a]
+            // Fast branchless HSV→RGB in f32 (hue wraps mod 360; s/v clamp 0..1).
+            let s = c1.clamp(0.0, 1.0) as f32;
+            let v = c2.clamp(0.0, 1.0) as f32;
+            if s <= 0.0 {
+                return [v, v, v, a];
+            }
+            let mut h = (c0 * (1.0 / 360.0)).fract() as f32;
+            if h < 0.0 {
+                h += 1.0;
+            }
+            let (r, g, b) = hsv_to_rgb_f32(h, s, v);
+            [r, g, b, a]
         }
     }
 }
 
-/// HSV→RGB (h in degrees 0..360, s/v in 0..1) → r/g/b in 0..1.
-fn hsv_to_rgb(h: f64, s: f64, v: f64) -> (f64, f64, f64) {
-    if s <= 0.0 {
-        return (v, v, v);
-    }
-    let h = h / 60.0;
-    let sector = h.floor();
-    let f = h - sector;
-    let p = v * (1.0 - s);
-    let q = v * (1.0 - s * f);
-    let t = v * (1.0 - s * (1.0 - f));
-    match (sector as i64).rem_euclid(6) {
-        0 => (v, t, p),
-        1 => (q, v, p),
-        2 => (p, v, t),
-        3 => (p, q, v),
-        4 => (t, p, v),
-        _ => (v, p, q),
-    }
+/// Branchless HSV→RGB (`h` in `[0, 1)`, `s`/`v` in `[0, 1]`) → `(r, g, b)` in `[0, 1]`.
+#[inline]
+fn hsv_to_rgb_f32(h: f32, s: f32, v: f32) -> (f32, f32, f32) {
+    let f = |offset: f32| {
+        let x = h + offset;
+        let frac = x - x.floor();
+        let p = (frac * 6.0 - 3.0).abs() - 1.0;
+        v * (1.0 + s * (p.clamp(0.0, 1.0) - 1.0))
+    };
+    (f(0.0), f(2.0 / 3.0), f(1.0 / 3.0))
 }
 
 /// Evaluates an optional `visible` gate: absent ⇒ visible; present ⇒ `>= 0.5`.
@@ -649,7 +890,6 @@ fn shape_kind(layer: &Layer) -> ShapeKind {
             Shape::Circle => ShapeKind::Circle,
             Shape::Triangle => ShapeKind::Triangle,
         },
-        // Non-instanced layers never call this; default to Rect defensively.
         _ => ShapeKind::Rect,
     }
 }
@@ -678,8 +918,6 @@ fn default_setting_values(art: &LoadedArtifact) -> IndexMap<String, SettingValue
 }
 
 /// The declared-default [`SettingValue`] for a single [`SettingDecl`] (contract §4).
-/// Exposed so persistence can fall back to the default for a missing/invalid stored
-/// value without duplicating the kind→value mapping.
 pub fn default_setting_value(decl: &viz_contract::SettingDecl) -> SettingValue {
     use viz_contract::SettingDecl;
     match decl {
@@ -701,8 +939,6 @@ pub fn default_setting_value(decl: &viz_contract::SettingDecl) -> SettingValue {
 }
 
 /// Parses a `#RRGGBB` / `#RRGGBBAA` hex color into straight-alpha `0..1` channels.
-/// The loader has already validated the format; a malformed value falls back to
-/// opaque white so a default never panics.
 fn parse_hex_color(s: &str) -> (f64, f64, f64, f64) {
     let body = s.strip_prefix('#').unwrap_or(s);
     let byte = |i: usize| -> f64 {

@@ -71,8 +71,8 @@ pub use builtins::{
 
 // Compilation surface.
 pub use compile::{
-    compile, CompileError, CompileErrorKind, Scope, ScopeBuilder, ScopeError, SlotId, MAX_DEPTH,
-    MAX_OPS, MAX_SOURCE_LEN,
+    compile, compile_multi, CompileError, CompileErrorKind, MultiInput, Scope, ScopeBuilder,
+    ScopeError, SlotId, MAX_DEPTH, MAX_OPS, MAX_SOURCE_LEN,
 };
 
 // AST — public so a reference evaluator (and downstream analyses) can walk the
@@ -85,8 +85,8 @@ pub use lexer::{lex, LexError, Token, TokenKind};
 // VM and bytecode. The scalar-application helpers are public so the property
 // test's reference evaluator reproduces the VM's semantics bit-for-bit.
 pub use vm::{
-    apply_binary, apply_unary, builtin_arity, sanitize, BinaryKind, Op, Program, UnaryKind, Vm,
-    STACK_SIZE,
+    apply_binary, apply_unary, builtin_arity, sanitize, BinaryKind, MultiProgram, Op, Program,
+    UnaryKind, Vm, MAX_MULTI_OUTS, MAX_TEMPS, STACK_SIZE,
 };
 
 #[cfg(test)]
@@ -382,5 +382,105 @@ mod tests {
         // Different seed differs.
         let mut c = Vm::new(scope.slot_count(), 43);
         assert_ne!(va, c.eval(&prog));
+    }
+
+    #[test]
+    fn compile_multi_matches_individual_programs_bitwise() {
+        let mut b = Scope::builder();
+        let t = b.slot("t").unwrap();
+        let energy = b.slot("energy").unwrap();
+        let low = b.slot("low").unwrap();
+        let high = b.slot("high").unwrap();
+        let i_slot = b.slot("i").unwrap();
+        let x_slot = b.slot("x").unwrap();
+        let y_slot = b.slot("y").unwrap();
+        let scope = b.build();
+
+        // 1. Cross-formula CSE + frame hoisting (starfield / pixel-rain pattern).
+        let exprs = [
+            "fract(rand(i) * 0.5 + t * (0.25 + 0.75 * rand(i + 700))) * cos(rand(i + 300) * tau)",
+            "fract(rand(i) * 0.5 + t * (0.25 + 0.75 * rand(i + 700))) * sin(rand(i + 300) * tau)",
+            "(0.3 + 0.7 * smoothstep(0.02, 0.12, energy)) * pow(fract(rand(i) * 0.5 + t * (0.25 + 0.75 * rand(i + 700))), 2)",
+            "(i % 18) / 18 + floor(i / 18) * 0.1",
+        ];
+        let singles: Vec<_> = exprs.iter().map(|s| compile(s, &scope).unwrap()).collect();
+        let inputs: Vec<_> = exprs.iter().map(|s| MultiInput::Expr(s)).collect();
+        let multi = compile_multi(&inputs, &scope, &[i_slot], None, None).unwrap();
+
+        let mut vm_single = Vm::new(scope.slot_count(), 12345);
+        let mut vm_multi = Vm::new(scope.slot_count(), 12345);
+        for vm in [&mut vm_single, &mut vm_multi] {
+            vm.set_slot(t, 12.345);
+            vm.set_slot(energy, 0.42);
+            vm.set_slot(low, 0.65);
+            vm.set_slot(high, 0.25);
+        }
+
+        let mut outs = [0.0f64; MAX_MULTI_OUTS];
+        vm_multi.eval_multi_hoisted(&multi, &mut outs);
+        for i in 0..40 {
+            vm_single.set_slot(i_slot, i as f64);
+            vm_multi.set_slot(i_slot, i as f64);
+            vm_multi.eval_multi_item(&multi, &mut outs);
+            for (k, p) in singles.iter().enumerate() {
+                assert_eq!(
+                    outs[k].to_bits(),
+                    vm_single.eval(p).to_bits(),
+                    "mismatch at i={i}, out={k}"
+                );
+            }
+        }
+
+        // 2. Field 1D row/col + frame hoisting (color-field pattern).
+        let field_exprs = [
+            "sin(x * 3 + t + 2 * low) + cos(y * 3 - t + 2 * high) + sin((x + y) * 2 + t)",
+            "0.5 + 0.5 * smoothstep(0.02, 0.12, energy) * cos(y * 3 - t + 2 * high)",
+            "0.2 + 0.4 * sin(x * 3 + t + 2 * low)",
+            "1",
+        ];
+        let field_singles: Vec<_> = field_exprs
+            .iter()
+            .map(|s| compile(s, &scope).unwrap())
+            .collect();
+        let field_inputs: Vec<_> = field_exprs.iter().map(|s| MultiInput::Expr(s)).collect();
+        let field_multi =
+            compile_multi(&field_inputs, &scope, &[i_slot], Some(y_slot), Some(x_slot)).unwrap();
+        assert!(field_multi.num_col() > 0);
+        assert!(field_multi.has_row_ops());
+
+        let mut f_outs = [0.0f64; MAX_MULTI_OUTS];
+        vm_multi.eval_multi_hoisted(&field_multi, &mut f_outs);
+        let res = 8usize;
+        let num_col = field_multi.num_col();
+        let mut col_table = vec![0.0f64; res * num_col];
+        for col in 0..res {
+            let cx = -1.0 + (col as f64 + 0.5) * 2.0 / res as f64;
+            vm_multi.set_slot(x_slot, cx);
+            vm_multi.eval_multi_col(
+                &field_multi,
+                &mut col_table[col * num_col..(col + 1) * num_col],
+            );
+        }
+        for row in 0..res {
+            let cy = -1.0 + (row as f64 + 0.5) * 2.0 / res as f64;
+            vm_single.set_slot(y_slot, cy);
+            vm_multi.set_slot(y_slot, cy);
+            vm_multi.eval_multi_row(&field_multi, &mut f_outs);
+            for col in 0..res {
+                let cx = -1.0 + (col as f64 + 0.5) * 2.0 / res as f64;
+                vm_single.set_slot(x_slot, cx);
+                vm_multi.set_slot(x_slot, cx);
+                vm_multi
+                    .load_multi_col(&field_multi, &col_table[col * num_col..(col + 1) * num_col]);
+                vm_multi.eval_multi_item(&field_multi, &mut f_outs);
+                for (k, p) in field_singles.iter().enumerate() {
+                    assert_eq!(
+                        f_outs[k].to_bits(),
+                        vm_single.eval(p).to_bits(),
+                        "field mismatch at ({col},{row}), out={k}"
+                    );
+                }
+            }
+        }
     }
 }

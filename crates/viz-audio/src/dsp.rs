@@ -156,11 +156,13 @@ pub struct Analyzer {
     mag: Vec<f32>,   // per-bin magnitude for the onset detector
 
     // Band mapping & state.
-    bin_to_band: Vec<usize>,
-    band_count_per: [u32; BAND_COUNT], // bins per band (for averaging)
+    /// Contiguous `[start..end)` FFT bin range per band (empty if 0-bin band).
+    band_ranges: [(usize, usize); BAND_COUNT],
+    /// Precomputed `1.0 / count` for non-empty bands (`0.0` for 0-bin bands).
+    inv_band_count: [f32; BAND_COUNT],
     band_interp: [Option<(usize, usize, f32)>; BAND_COUNT], // fallback for 0-bin bands
-    band_peak: [f32; BAND_COUNT],      // AGC running peak per band
-    band_smooth: [f32; BAND_COUNT],    // smoothed output per band
+    band_peak: [f32; BAND_COUNT],                           // AGC running peak per band
+    band_smooth: [f32; BAND_COUNT],                         // smoothed output per band
 
     // Aggregate cutoffs in bins.
     low_hi_bin: usize,
@@ -205,9 +207,21 @@ impl Analyzer {
 
         let bin_to_band = build_bin_to_band();
         let mut band_count_per = [0u32; BAND_COUNT];
-        for &b in &bin_to_band {
+        let mut band_ranges = [(0usize, 0usize); BAND_COUNT];
+        for (bin, &b) in bin_to_band.iter().enumerate() {
             if b != usize::MAX {
+                if band_count_per[b] == 0 {
+                    band_ranges[b] = (bin, bin + 1);
+                } else {
+                    band_ranges[b].1 = bin + 1;
+                }
                 band_count_per[b] += 1;
+            }
+        }
+        let mut inv_band_count = [0.0f32; BAND_COUNT];
+        for k in 0..BAND_COUNT {
+            if band_count_per[k] > 0 {
+                inv_band_count[k] = 1.0 / band_count_per[k] as f32;
             }
         }
         let band_interp = build_empty_band_interp(&band_count_per);
@@ -230,8 +244,8 @@ impl Analyzer {
             fft_scratch,
             power: vec![0.0; SPECTRUM_BINS],
             mag: vec![0.0; SPECTRUM_BINS],
-            bin_to_band,
-            band_count_per,
+            band_ranges,
+            inv_band_count,
             band_interp,
             band_peak: [AGC_PEAK_FLOOR; BAND_COUNT],
             band_smooth: [0.0; BAND_COUNT],
@@ -280,14 +294,22 @@ impl Analyzer {
         mono: &[f32],
         mut on_hop: impl FnMut(&FeatureFrame, &[BeatEvent]),
     ) {
-        for &s in mono {
-            self.ring[self.write_pos] = s;
-            self.write_pos = (self.write_pos + 1) % FFT_SIZE;
-            if self.ring_filled < FFT_SIZE {
-                self.ring_filled += 1;
+        let mut offset = 0;
+        while offset < mono.len() {
+            let until_hop = HOP_SIZE.saturating_sub(self.since_hop).max(1);
+            let until_wrap = FFT_SIZE - self.write_pos;
+            let chunk = (mono.len() - offset).min(until_hop).min(until_wrap);
+
+            self.ring[self.write_pos..self.write_pos + chunk]
+                .copy_from_slice(&mono[offset..offset + chunk]);
+            self.write_pos += chunk;
+            if self.write_pos == FFT_SIZE {
+                self.write_pos = 0;
             }
-            self.samples_processed += 1;
-            self.since_hop += 1;
+            self.ring_filled = (self.ring_filled + chunk).min(FFT_SIZE);
+            self.samples_processed += chunk as u64;
+            self.since_hop += chunk;
+            offset += chunk;
 
             if self.since_hop >= HOP_SIZE && self.ring_filled >= FFT_SIZE {
                 self.since_hop = 0;
@@ -306,22 +328,69 @@ impl Analyzer {
 
     /// Runs the analysis on the current window. Allocation-free.
     fn analyze_hop(&mut self) -> HopOutput {
-        // 1. Copy the ring (oldest→newest) into the windowed FFT input, and
-        //    capture the most-recent WAVEFORM_LEN raw samples for the waveform.
-        //    The oldest sample is at `write_pos` (next-to-overwrite).
         let mut frame = FeatureFrame::default();
+        let t = self.clock_secs();
+
+        // 1. Compute hop RMS energy across the two contiguous slices of the ring
+        //    buffer (auto-vectorizable). The oldest sample is at `write_pos`.
+        let wp = self.write_pos;
+        let tail = &self.ring[wp..];
+        let head = &self.ring[..wp];
         let mut rms_acc = 0.0f64;
-        for i in 0..FFT_SIZE {
-            let idx = (self.write_pos + i) % FFT_SIZE;
-            let raw = self.ring[idx];
-            self.fft_in[i] = raw * self.window[i];
+        for &raw in tail {
             rms_acc += (raw as f64) * (raw as f64);
         }
+        for &raw in head {
+            rms_acc += (raw as f64) * (raw as f64);
+        }
+
+        // Fast path for exact digital silence: skip Hann windowing, 1024-pt FFT,
+        // 513 sqrts, 48-band folding, and SuperFlux spectral loops (>95% DSP CPU
+        // saved during silence) while decaying AGC/band/energy/beat/onset state
+        // identically to a zero-spectrum hop.
+        if rms_acc == 0.0 {
+            for k in 0..BAND_COUNT {
+                self.band_peak[k] = (self.band_peak[k] * AGC_PEAK_DECAY).max(AGC_PEAK_FLOOR);
+                let smoothed = self.band_smooth[k] * BAND_RELEASE;
+                self.band_smooth[k] = smoothed;
+                frame.bands[k] = sanitize(smoothed).clamp(0.0, 1.0);
+            }
+            self.energy_ewma *= ENERGY_EWMA;
+            frame.energy = sanitize(self.energy_ewma).clamp(0.0, 1.0);
+
+            let _ = self.onset.process_silence();
+            self.beat_pulse *= BEAT_DECAY;
+            frame.beat = sanitize(self.beat_pulse).clamp(0.0, 1.0);
+            frame.beat_count = self.beat_count;
+
+            frame.t = t;
+            self.silence_run = self.silence_run.saturating_add(HOP_SIZE as u64);
+            let silence_thresh = (SILENCE_SECS * SAMPLE_RATE as f64) as u64;
+            frame.silence = self.silence_run >= silence_thresh;
+            return HopOutput { frame, beat: None };
+        }
+
+        // 1b. Apply Hann window across the two contiguous slices into `fft_in`.
+        let tail_len = tail.len();
+        for (dst, (&raw, &w)) in self.fft_in[..tail_len]
+            .iter_mut()
+            .zip(tail.iter().zip(self.window[..tail_len].iter()))
+        {
+            *dst = raw * w;
+        }
+        for (dst, (&raw, &w)) in self.fft_in[tail_len..]
+            .iter_mut()
+            .zip(head.iter().zip(self.window[tail_len..].iter()))
+        {
+            *dst = raw * w;
+        }
+
         // Waveform = the most recent WAVEFORM_LEN raw samples of the window.
-        for (j, slot) in frame.waveform.iter_mut().enumerate() {
-            let i = FFT_SIZE - WAVEFORM_LEN + j;
-            let idx = (self.write_pos + i) % FFT_SIZE;
-            *slot = self.ring[idx];
+        let wf_start = (wp + FFT_SIZE - WAVEFORM_LEN) % FFT_SIZE;
+        let wf_first = (FFT_SIZE - wf_start).min(WAVEFORM_LEN);
+        frame.waveform[..wf_first].copy_from_slice(&self.ring[wf_start..wf_start + wf_first]);
+        if wf_first < WAVEFORM_LEN {
+            frame.waveform[wf_first..].copy_from_slice(&self.ring[..WAVEFORM_LEN - wf_first]);
         }
 
         // 2. FFT (zero allocation).
@@ -330,39 +399,36 @@ impl Analyzer {
             .expect("FFT lengths are fixed at construction");
 
         // 3. Per-bin power & magnitude.
-        let norm = 1.0 / FFT_SIZE as f32;
+        let inv_n2 = (1.0 / FFT_SIZE as f32) * (1.0 / FFT_SIZE as f32);
         for (k, c) in self.fft_out.iter().enumerate() {
-            let p = (c.re * c.re + c.im * c.im) * norm * norm;
+            let p = (c.re * c.re + c.im * c.im) * inv_n2;
             self.power[k] = p;
             self.mag[k] = p.sqrt();
         }
 
-        // 4. Fold bins into 48 band powers (mean power per band).
-        let mut band_raw = [0.0f32; BAND_COUNT];
-        for (bin, &b) in self.bin_to_band.iter().enumerate() {
-            if b != usize::MAX {
-                band_raw[b] += self.power[bin];
-            }
-        }
-        // 5. Per-band normalize → AGC → asymmetric smoothing → bands[48] ∈ 0..1.
-        for (k, raw) in band_raw.iter_mut().enumerate() {
-            if self.band_count_per[k] > 0 {
-                *raw /= self.band_count_per[k] as f32;
+        // 4–5. Fold contiguous bin ranges into 48 bands → AGC → asymmetric smoothing.
+        for k in 0..BAND_COUNT {
+            let inv = self.inv_band_count[k];
+            let raw = if inv > 0.0 {
+                let (lo, hi) = self.band_ranges[k];
+                let sum: f32 = self.power[lo..hi].iter().sum();
+                sum * inv
             } else if let Some((lo, hi, frac)) = self.band_interp[k] {
-                *raw = self.power[lo] * (1.0 - frac) + self.power[hi] * frac;
-            }
+                self.power[lo] * (1.0 - frac) + self.power[hi] * frac
+            } else {
+                0.0
+            };
             // Use amplitude (sqrt of mean power) for a perceptually flatter scale.
             let amp = raw.sqrt();
 
             // Decay the running peak, then raise it to the new value if larger.
-            let peak = (self.band_peak[k] * AGC_PEAK_DECAY).max(AGC_PEAK_FLOOR);
-            let peak = peak.max(amp);
+            let peak = (self.band_peak[k] * AGC_PEAK_DECAY)
+                .max(AGC_PEAK_FLOOR)
+                .max(amp);
             self.band_peak[k] = peak;
 
             let target = (amp / peak).clamp(0.0, 1.0);
             let prev = self.band_smooth[k];
-            // Asymmetric one-pole: fast attack (rising), slow release (falling).
-            // `coeff` is the retention factor toward `prev`.
             let smoothed = if target > prev {
                 prev + (target - prev) * BAND_ATTACK
             } else {
@@ -372,27 +438,15 @@ impl Analyzer {
             frame.bands[k] = sanitize(smoothed).clamp(0.0, 1.0);
         }
 
-        // 6. Aggregates low/mid/high from the same powers (amplitude scale).
-        let (mut low_p, mut mid_p, mut high_p) = (0.0f32, 0.0f32, 0.0f32);
-        let (mut low_n, mut mid_n, mut high_n) = (0u32, 0u32, 0u32);
-        for (bin, &p) in self.power.iter().enumerate() {
-            if bin == 0 {
-                continue; // skip DC
-            }
-            if bin <= self.low_hi_bin {
-                low_p += p;
-                low_n += 1;
-            } else if bin <= self.mid_hi_bin {
-                mid_p += p;
-                mid_n += 1;
-            } else {
-                high_p += p;
-                high_n += 1;
-            }
-        }
-        frame.low = aggregate_level(low_p, low_n);
-        frame.mid = aggregate_level(mid_p, mid_n);
-        frame.high = aggregate_level(high_p, high_n);
+        // 6. Aggregates low/mid/high from contiguous slices of `self.power` (skip DC bin 0).
+        let low_end = self.low_hi_bin.min(SPECTRUM_BINS - 1);
+        let mid_end = self.mid_hi_bin.min(SPECTRUM_BINS - 1);
+        let low_slice = &self.power[1..=low_end];
+        let mid_slice = &self.power[low_end + 1..=mid_end];
+        let high_slice = &self.power[mid_end + 1..];
+        frame.low = aggregate_level(low_slice.iter().sum(), low_slice.len() as u32);
+        frame.mid = aggregate_level(mid_slice.iter().sum(), mid_slice.len() as u32);
+        frame.high = aggregate_level(high_slice.iter().sum(), high_slice.len() as u32);
 
         // 7. Energy from hop RMS through an EWMA.
         let rms = (rms_acc / FFT_SIZE as f64).sqrt() as f32;
@@ -401,7 +455,6 @@ impl Analyzer {
         frame.energy = sanitize(self.energy_ewma).clamp(0.0, 1.0);
 
         // 8. Onset detection on the magnitude spectrum.
-        let t = self.clock_secs();
         let onset = self.onset.process(&self.mag, t);
         let mut beat_ev = None;
         if onset.is_onset {

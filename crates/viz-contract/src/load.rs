@@ -328,6 +328,40 @@ pub struct SlotLayout {
     pub slot_count: usize,
 }
 
+impl SlotLayout {
+    /// Reconstructs the master [`viz_expr::Scope`] with identical slot indices to
+    /// this layout (used by the runtime to build multi-output CSE/LICM layer programs).
+    pub fn to_scope(&self) -> Scope {
+        let mut b = Scope::builder();
+        for name in SHARED_INPUTS {
+            b.slot(name).expect("shared inputs are valid");
+        }
+        for (name, slots) in &self.settings {
+            match slots {
+                SettingSlots::Scalar(_) => {
+                    b.slot(&format!("settings.{name}"))
+                        .expect("setting name is valid");
+                }
+                SettingSlots::Color { .. } => {
+                    for suffix in ["_r", "_g", "_b", "_a"] {
+                        b.slot(&format!("settings.{name}{suffix}"))
+                            .expect("color channel name is valid");
+                    }
+                }
+            }
+        }
+        for name in self.vars.keys() {
+            b.slot(name.as_str()).expect("var name is valid");
+        }
+        for name in STAGE_EXTRAS {
+            b.slot(name).expect("stage extras are valid");
+        }
+        let scope = b.build();
+        debug_assert_eq!(scope.slot_count(), self.slot_count);
+        scope
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Compiled formulas & programs
 // ---------------------------------------------------------------------------
@@ -360,6 +394,15 @@ impl CompiledFormula {
         match self {
             CompiledFormula::Const(_) => 0,
             CompiledFormula::Program(p) => p.op_count(),
+        }
+    }
+
+    /// Returns `true` if evaluating this formula loads any slot in `slots`.
+    #[inline]
+    pub fn reads_any_slot(&self, slots: &[SlotId]) -> bool {
+        match self {
+            CompiledFormula::Const(_) => false,
+            CompiledFormula::Program(p) => p.reads_any_slot(slots),
         }
     }
 }
@@ -1343,7 +1386,7 @@ fn compile_formula(
         )
     })?;
 
-    // Artifact-wide op cap.
+    // Artifact-wide op cap (enforced on syntactic op count before constant folding).
     *total_ops += program.op_count();
     if *total_ops > limits::MAX_OPS_PER_ARTIFACT {
         return Err(LoadDiagnostic::new(

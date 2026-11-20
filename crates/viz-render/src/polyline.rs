@@ -10,7 +10,9 @@
 //!
 //! Pre-allocated for `MAX_POINTS` points per layer ⇒ `MAX_POINTS` segments (closed).
 
-use wgpu::util::DeviceExt;
+use std::num::NonZeroU64;
+
+use wgpu::util::{DeviceExt, StagingBelt};
 
 use crate::{BlendMode, PointData, MAX_POINTS};
 
@@ -173,7 +175,8 @@ impl PolylinePipelines {
     #[allow(clippy::too_many_arguments)]
     pub fn push(
         &mut self,
-        queue: &wgpu::Queue,
+        belt: &mut StagingBelt,
+        encoder: &mut wgpu::CommandEncoder,
         blend: BlendMode,
         thickness_px: f32,
         closed: bool,
@@ -196,10 +199,21 @@ impl PolylinePipelines {
                 half_px * 2.0 / width.max(1) as f32,
                 half_px * 2.0 / height.max(1) as f32,
             ];
-            let seg_count = if closed { n } else { n - 1 };
-            for s in 0..seg_count {
-                let a = &points[s];
-                let b = &points[(s + 1) % n];
+            for pair in points[..n].windows(2) {
+                let a = &pair[0];
+                let b = &pair[1];
+                self.staging.push(Segment {
+                    p0: [a.x, a.y],
+                    p1: [b.x, b.y],
+                    half_ndc,
+                    _pad: [0.0, 0.0],
+                    c0: a.color,
+                    c1: b.color,
+                });
+            }
+            if closed {
+                let a = &points[n - 1];
+                let b = &points[0];
                 self.staging.push(Segment {
                     p0: [a.x, a.y],
                     p1: [b.x, b.y],
@@ -217,11 +231,11 @@ impl PolylinePipelines {
         let base = self.cursor;
         if take > 0 {
             let offset = base as u64 * std::mem::size_of::<Segment>() as u64;
-            queue.write_buffer(
-                &self.segments,
-                offset,
-                bytemuck::cast_slice(&self.staging[..take]),
-            );
+            let bytes = bytemuck::cast_slice(&self.staging[..take]);
+            if let Some(size) = NonZeroU64::new(bytes.len() as u64) {
+                belt.write_buffer(encoder, &self.segments, offset, size)
+                    .copy_from_slice(bytes);
+            }
         }
         self.records[self.len] = LayerRecord {
             blend,

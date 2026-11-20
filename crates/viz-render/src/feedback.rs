@@ -17,6 +17,10 @@
 //! no garbage from a stale-sized texture ever flashes during a resize. The roles are also
 //! reset deterministically.
 
+use std::num::NonZeroU64;
+
+use wgpu::util::StagingBelt;
+
 use crate::{CLEAR_COLOR, CLEAR_COLOR_TRANSPARENT};
 
 /// Two-texture ping-pong accumulator + the fullscreen decay/blit pipelines.
@@ -52,6 +56,8 @@ pub struct Feedback {
     /// Tracks the previous `transparent_bg` mode so toggling transparency marks the
     /// accumulators dirty and clears them cleanly to the new background color.
     last_transparent: bool,
+    /// Cached decay uniform value so unchanged decay scalars skip `queue.write_buffer`.
+    last_decay: Option<f32>,
 }
 
 impl Feedback {
@@ -212,6 +218,7 @@ impl Feedback {
             decay_uniform_bind,
             dirty: true,
             last_transparent: false,
+            last_decay: None,
         }
     }
 
@@ -335,13 +342,15 @@ impl Feedback {
         &self.views[self.curr()]
     }
 
-    /// Records the decay pass: render `curr = prev * decay`, sampling `prev`. After this
-    /// the layers draw into `curr` with `LoadOp::Load`.
-    ///
-    /// The decay scalar must already be in the uniform via [`Feedback::set_decay`]
-    /// (queued before recording). Clears freshly (re)allocated accumulators first
-    /// (and re-clears cleanly if `transparent_bg` toggled since the previous frame).
-    pub fn decay_pass(&mut self, encoder: &mut wgpu::CommandEncoder, transparent_bg: bool) {
+    /// Marks the accumulator textures dirty so they will be cleared before the next
+    /// active feedback frame (e.g., after bypassing feedback while `decay == 0`).
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    /// Prepares the accumulator textures for a merged decay+layers pass: clears both
+    /// accumulators if freshly allocated, bypassed, or if `transparent_bg` changed.
+    pub fn prepare_frame(&mut self, encoder: &mut wgpu::CommandEncoder, transparent_bg: bool) {
         if self.last_transparent != transparent_bg {
             self.last_transparent = transparent_bg;
             self.dirty = true;
@@ -352,33 +361,36 @@ impl Feedback {
             CLEAR_COLOR
         };
         self.clear_if_dirty(encoder, clear_color);
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("feedback-decay"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &self.views[self.curr()],
-                resolve_target: None,
-                depth_slice: None,
-                ops: wgpu::Operations {
-                    // Overwritten entirely by the fullscreen pass.
-                    load: wgpu::LoadOp::Clear(clear_color),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
+    }
+
+    /// Records the fullscreen decay draw (`curr = prev * decay`) inside an already-open
+    /// render pass targeting [`Feedback::target_view`], so layers can composite right on
+    /// top in the same render pass without a Store+Load round-trip.
+    pub fn draw_decay<'p>(&'p self, pass: &mut wgpu::RenderPass<'p>) {
         pass.set_pipeline(&self.decay_pipeline);
         pass.set_bind_group(0, &self.sample_bind[self.prev], &[]);
         pass.set_bind_group(1, &self.decay_uniform_bind, &[]);
         pass.draw(0..3, 0..1);
     }
 
-    /// Writes the decay scalar into the uniform (queued; call before recording the frame).
-    pub fn set_decay(&self, queue: &wgpu::Queue, decay: f32) {
-        let v = [decay.clamp(0.0, 0.99), 0.0, 0.0, 0.0];
-        queue.write_buffer(&self.decay_uniform, 0, bytemuck::cast_slice(&v));
+    /// Writes the decay scalar into the uniform only when it changed since last frame.
+    pub fn set_decay(
+        &mut self,
+        belt: &mut StagingBelt,
+        encoder: &mut wgpu::CommandEncoder,
+        decay: f32,
+    ) {
+        let clamped = decay.clamp(0.0, 0.99);
+        if self.last_decay == Some(clamped) {
+            return;
+        }
+        let v = [clamped, 0.0, 0.0, 0.0];
+        let bytes = bytemuck::cast_slice(&v);
+        if let Some(size) = NonZeroU64::new(bytes.len() as u64) {
+            belt.write_buffer(encoder, &self.decay_uniform, 0, size)
+                .copy_from_slice(bytes);
+        }
+        self.last_decay = Some(clamped);
     }
 
     /// Records the blit pass: copy `curr` onto `dst` (the surface). Then advances the

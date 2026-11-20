@@ -236,7 +236,15 @@ pub struct Renderer {
     polyline: polyline::PolylinePipelines,
     field: field::FieldPipelines,
     feedback: feedback::Feedback,
+    /// Reusable mapped staging buffers so steady-state geometry uploads avoid
+    /// per-frame `queue.write_buffer` kernel buffer allocations and extra Metal
+    /// staging command buffers.
+    staging_belt: wgpu::util::StagingBelt,
 }
+
+/// Chunk size for [`Renderer::staging_belt`] (256 KiB comfortably holds a full
+/// typical frame's geometry + uniforms in a single reusable mapped buffer).
+const STAGING_BELT_CHUNK_BYTES: wgpu::BufferAddress = 256 * 1024;
 
 impl Renderer {
     /// Builds the renderer: all pipelines, buffers, and the feedback target.
@@ -256,6 +264,7 @@ impl Renderer {
         let polyline = polyline::PolylinePipelines::new(device, surface_format);
         let field = field::FieldPipelines::new(device, surface_format);
         let feedback = feedback::Feedback::new(device, surface_format, width, height);
+        let staging_belt = wgpu::util::StagingBelt::new(device.clone(), STAGING_BELT_CHUNK_BYTES);
         let _ = queue; // queue not needed at construction; kept for API symmetry.
         Self {
             format: surface_format,
@@ -265,7 +274,14 @@ impl Renderer {
             polyline,
             field,
             feedback,
+            staging_belt,
         }
+    }
+
+    /// Reclaims completed staging chunks after `queue.submit(...)` so the next frame
+    /// reuses mapped GPU buffers with zero kernel allocations.
+    pub fn recall_staging(&mut self) {
+        self.staging_belt.recall();
     }
 
     /// Reallocates size-dependent targets for a new surface size (glitch-free: the
@@ -303,10 +319,15 @@ impl Renderer {
         params: &SceneParams,
         layers: &[LayerDraw],
     ) {
-        let _ = device; // sizes are fixed by resize(); no per-frame device use.
+        let _ = (device, queue); // sizes are fixed by resize(); uploads go through staging_belt.
 
-        // Upload all per-layer geometry once, up front, so render passes only bind+draw.
-        self.upload(queue, layers);
+        // Reclaim any staging chunks whose previous submit finished (safe even if the
+        // caller did not invoke `recall_staging` after submit).
+        self.staging_belt.recall();
+
+        // Upload all per-layer geometry once, up front, via the reusable StagingBelt
+        // onto our frame encoder (zero per-frame MTLBuffer creation / extra cmd buffer).
+        self.upload(encoder, layers);
 
         let clear_color = if params.transparent_bg {
             CLEAR_COLOR_TRANSPARENT
@@ -314,8 +335,15 @@ impl Renderer {
             CLEAR_COLOR
         };
 
-        match params.feedback_decay {
+        let active_decay = params
+            .feedback_decay
+            .map(|d| d.clamp(0.0, 0.99))
+            .filter(|&d| d > 0.0);
+
+        match active_decay {
             None => {
+                // Mark accumulators dirty so re-enabling feedback later clears stale history.
+                self.feedback.mark_dirty();
                 // Direct path: clear surface, draw layers on top.
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("viz-render-direct"),
@@ -336,12 +364,13 @@ impl Renderer {
                 self.draw_layers(&mut pass, layers);
             }
             Some(decay) => {
-                let decay = decay.clamp(0.0, 0.99);
-                // Queue the decay scalar before recording the pass that reads it.
-                self.feedback.set_decay(queue, decay);
-                // 1) Multiply the previous accumulator by decay into `curr` (ping-pong).
-                self.feedback.decay_pass(encoder, params.transparent_bg);
-                // 2) Draw this frame's layers INTO the feedback texture (load, don't clear).
+                // Queue the decay scalar (cached) before recording the pass that reads it.
+                self.feedback
+                    .set_decay(&mut self.staging_belt, encoder, decay);
+                // Clear accumulators lazily if resized, bypassed, or transparency toggled.
+                self.feedback.prepare_frame(encoder, params.transparent_bg);
+                // Merged pass: draw `prev * decay` fullscreen triangle AND all layers into
+                // `curr` inside one render pass (avoids a full-resolution Store+Load round-trip).
                 {
                     let view = self.feedback.target_view();
                     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -351,7 +380,7 @@ impl Renderer {
                             resolve_target: None,
                             depth_slice: None,
                             ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Load,
+                                load: wgpu::LoadOp::Clear(clear_color),
                                 store: wgpu::StoreOp::Store,
                             },
                         })],
@@ -360,17 +389,22 @@ impl Renderer {
                         occlusion_query_set: None,
                         multiview_mask: None,
                     });
+                    self.feedback.draw_decay(&mut pass);
                     self.draw_layers(&mut pass, layers);
                 }
-                // 3) Blit feedback → surface (clear the surface first, then copy).
+                // Blit feedback → surface (clear the surface first, then copy).
                 self.feedback
                     .blit_to(encoder, surface_view, params.transparent_bg);
             }
         }
+
+        // Unmap active staging chunks before the caller submits `encoder.finish()`.
+        self.staging_belt.finish();
     }
 
-    /// Uploads all geometry for this frame into the pre-allocated GPU buffers.
-    fn upload(&mut self, queue: &wgpu::Queue, layers: &[LayerDraw]) {
+    /// Uploads all geometry for this frame into the pre-allocated GPU buffers via
+    /// the reusable [`StagingBelt`].
+    fn upload(&mut self, encoder: &mut wgpu::CommandEncoder, layers: &[LayerDraw]) {
         // Reset per-frame draw bookkeeping, then append each layer's data.
         self.instanced.begin_frame();
         self.polyline.begin_frame();
@@ -382,7 +416,8 @@ impl Renderer {
                     blend,
                     instances,
                 } => {
-                    self.instanced.push(queue, *shape, *blend, instances);
+                    self.instanced
+                        .push(&mut self.staging_belt, encoder, *shape, *blend, instances);
                 }
                 LayerDraw::Polyline {
                     blend,
@@ -391,7 +426,8 @@ impl Renderer {
                     points,
                 } => {
                     self.polyline.push(
-                        queue,
+                        &mut self.staging_belt,
+                        encoder,
                         *blend,
                         *thickness_px,
                         *closed,
@@ -405,10 +441,12 @@ impl Renderer {
                     resolution,
                     cells,
                 } => {
-                    self.field.push(queue, *blend, *resolution, cells);
+                    self.field
+                        .push(&mut self.staging_belt, encoder, *blend, *resolution, cells);
                 }
             }
         }
+        self.field.flush_params(&mut self.staging_belt, encoder);
     }
 
     /// Records draw calls for every layer, in order, into an open render pass.

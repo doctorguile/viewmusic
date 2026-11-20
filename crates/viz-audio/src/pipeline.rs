@@ -385,35 +385,58 @@ fn spawn_watchdog(
                 }
 
                 // Perform the real rebuild if (and only if) the scheduler's backoff
-                // gate says so this poll (MAJOR-1/2).
+                // gate says so this poll (MAJOR-1/2). During confirmed macOS silence
+                // (Granted + no device change + output device idle), skip the
+                // destructive tap+aggregate teardown so paused playback does not
+                // churn coreaudiod every 30 s.
+                let mut queried_running: Option<Option<bool>> = None;
                 if decision.action == RebuildAction::Attempt {
-                    match rebuild_capture(&mut capture, &sink, &health) {
-                        Ok(()) => scheduler.record_result(true, now),
-                        Err(e) => {
-                            // Rebuild failed: publish the generic Failed state
-                            // (feature-001 path) and back off. Keep `running` TRUE so
-                            // the policy keeps flagging the zero-buffer fault and the
-                            // backed-off retries actually fire (without this the
-                            // `running=false` set by the failed teardown would silence
-                            // the policy and strand us with no further attempts).
-                            health.set_running(true);
-                            health.set_state(CaptureState::Failed {
-                                message: crate::watchdog::failure_message(&e),
-                            });
-                            scheduler.record_result(false, now);
+                    let confirmed_idle_while_granted =
+                        tracker.state() == PermissionState::Granted && !device_changed && {
+                            let running_now = crate::tap::output_device_running_somewhere();
+                            queried_running = Some(running_now);
+                            running_now == Some(false)
+                        };
+                    if confirmed_idle_while_granted {
+                        policy.reset(now);
+                    } else {
+                        match rebuild_capture(&mut capture, &sink, &health) {
+                            Ok(()) => scheduler.record_result(true, now),
+                            Err(e) => {
+                                // Rebuild failed: publish the generic Failed state
+                                // (feature-001 path) and back off. Keep `running` TRUE so
+                                // the policy keeps flagging the zero-buffer fault and the
+                                // backed-off retries actually fire (without this the
+                                // `running=false` set by the failed teardown would silence
+                                // the policy and strand us with no further attempts).
+                                health.set_running(true);
+                                health.set_state(CaptureState::Failed {
+                                    message: crate::watchdog::failure_message(&e),
+                                });
+                                scheduler.record_result(false, now);
+                            }
                         }
+                        // Reset the zero-window so the policy does not immediately re-fire
+                        // NeedsRebuild before the new (or retried) tap has had a window to
+                        // warm up — the scheduler's backoff gate then spaces the retries.
+                        policy.reset(now);
                     }
-                    // Reset the zero-window so the policy does not immediately re-fire
-                    // NeedsRebuild before the new (or retried) tap has had a window to
-                    // warm up — the scheduler's backoff gate then spaces the retries.
-                    policy.reset(now);
                 }
 
-                // The silence-vs-revocation discriminator (D6). `None` (unreadable)
-                // is treated as "not running" so we never declare a false
-                // revocation on a read error (stays sticky-Granted).
-                let output_device_running =
-                    crate::tap::output_device_running_somewhere().unwrap_or(false);
+                // The silence-vs-revocation discriminator (D6): only read by
+                // `PermissionTracker` when `Granted && sustained_zeros &&
+                // rebuild_completed_still_zero`. Query lazily so steady-state
+                // playback makes 0 Core Audio HAL IPC calls/sec instead of 4 Hz.
+                let output_device_running = if tracker.state() == PermissionState::Granted
+                    && decision.sustained_zeros
+                    && decision.rebuild_completed_still_zero
+                {
+                    queried_running
+                        .unwrap_or_else(crate::tap::output_device_running_somewhere)
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
 
                 let obs = Observation {
                     saw_nonzero: health.saw_nonzero(),

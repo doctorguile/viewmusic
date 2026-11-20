@@ -23,7 +23,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use winit::event_loop::{ControlFlow, EventLoop};
+use winit::event_loop::EventLoop;
 
 use indexmap::IndexMap;
 use viz_app::logging;
@@ -169,8 +169,8 @@ fn main() {
     };
 
     let event_loop = EventLoop::new().expect("failed to create winit event loop");
-    // Poll keeps re-requesting redraws driving the (paced) render loop.
-    event_loop.set_control_flow(ControlFlow::Poll);
+    // `App::about_to_wait` drives frame pacing via `ControlFlow::WaitUntil` / `Wait`
+    // so the main thread sleeps in the OS kernel between frames instead of spinning.
 
     // Shared, mutable persisted state: the VizApp hooks update it live; we save the
     // relevant document immediately on each change (small, discrete writes — the

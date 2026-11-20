@@ -61,27 +61,31 @@ impl Default for FeatureFrame {
 impl FeatureFrame {
     /// Interpolated band lookup at normalized position `u` ∈ 0..1 (contract `band(u)`).
     /// Exact band k (0..47) is `band(k/47)`. Out-of-range `u` is clamped; NaN → 0.
+    #[inline]
     pub fn band(&self, u: f64) -> f64 {
-        lookup_lerp(&self.bands, u)
+        lookup_lerp_fixed(&self.bands, u)
     }
 
     /// Interpolated waveform lookup at `u` ∈ 0..1 (contract `wave(u)`).
     /// Exact sample k (0..255) is `wave(k/255)`.
+    #[inline]
     pub fn wave(&self, u: f64) -> f64 {
-        lookup_lerp(&self.waveform, u)
+        lookup_lerp_fixed(&self.waveform, u)
     }
 }
 
-fn lookup_lerp(values: &[f32], u: f64) -> f64 {
-    if values.is_empty() || !u.is_finite() {
+#[inline]
+fn lookup_lerp_fixed<const N: usize>(values: &[f32; N], u: f64) -> f64 {
+    if !u.is_finite() {
         return 0.0;
     }
+    let last = N - 1;
     let u = u.clamp(0.0, 1.0);
-    let pos = u * (values.len() - 1) as f64;
-    let i = pos.floor() as usize;
+    let pos = u * last as f64;
+    let i = pos as usize;
     let frac = pos - i as f64;
     let a = values[i] as f64;
-    let b = values[(i + 1).min(values.len() - 1)] as f64;
+    let b = values[(i + 1).min(last)] as f64;
     a + (b - a) * frac
 }
 

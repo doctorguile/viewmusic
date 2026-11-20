@@ -53,6 +53,17 @@ use crate::window::{
 /// clock delta is clamped to 100 ms.
 const MAX_DT: f64 = 0.1;
 
+/// Frame interval when showing static non-Active guidance screens (8 Hz).
+/// User input wakes immediately to the next 60 Hz slot.
+const STATIC_VIEW_FRAME_INTERVAL: Duration = Duration::from_millis(125);
+
+/// Frame interval during sustained audio silence with hidden overlay (20 Hz).
+/// Keeps ambient drift smooth while cutting idle CPU/GPU work by ~65%.
+const SILENT_FRAME_INTERVAL: Duration = Duration::from_millis(50);
+
+/// How long `feature.silence` must hold before stepping down to [`SILENT_FRAME_INTERVAL`].
+const SILENCE_THROTTLE_AFTER: Duration = Duration::from_secs(3);
+
 /// One selectable artifact in the dropdown (id + display name).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DropdownEntry {
@@ -283,6 +294,18 @@ pub struct VizApp {
     /// Whether the most recently rendered view was [`AppView::Active`], used to keep
     /// non-Active guidance screens opaque even when transparent mode is enabled.
     last_view_active: bool,
+    /// Wall-clock instant when sustained audio silence began (`None` while audio is active).
+    silent_since: Option<Instant>,
+    /// Target frame interval reported to the event loop (`about_to_wait`).
+    desired_interval: Duration,
+    /// True once an auto-hidden Active frame has run one clean empty egui pass to
+    /// clear panel rects/hover/cursor; while settled, `overlay.render()` is skipped.
+    overlay_hidden_settled: bool,
+    /// Cached matching [`WindowSizePreset`]; recomputed lazily on move/resize/scale
+    /// changes when the expanded panel is visible (avoids 60 Hz AppKit/CoreGraphics IPC).
+    cached_size_preset: Option<WindowSizePreset>,
+    /// Marks [`Self::cached_size_preset`] stale after window move/resize/scale events.
+    size_preset_dirty: bool,
     /// Optional hook to persist per-artifact setting values on edit/reset.
     on_setting_change: Option<SettingChangeHook>,
     /// Optional hook to fetch persisted setting overrides when an artifact becomes
@@ -402,6 +425,11 @@ impl VizApp {
             window_mode: WindowMode::default(),
             modifiers: ModifiersState::empty(),
             last_view_active: false,
+            silent_since: None,
+            desired_interval: crate::window::MIN_FRAME_INTERVAL,
+            overlay_hidden_settled: false,
+            cached_size_preset: None,
+            size_preset_dirty: true,
             on_setting_change: None,
             on_setting_restore: None,
             rebuild_library: None,
@@ -823,10 +851,15 @@ impl VizApp {
                 let frame = handle.latest_frame();
                 let permission = handle.permission_state();
                 // macOS routes running faults through its permission tracker;
-                // permission-free backends expose their real device/server errors.
+                // skip the CaptureHealth Mutex lock + clone when unused.
+                let capture_state = if AUDIO_PERMISSION_APPLIES {
+                    CaptureState::Active
+                } else {
+                    handle.capture_state()
+                };
                 let capture_failure = non_permission_capture_failure(
                     true,
-                    handle.capture_state(),
+                    capture_state,
                     self.start_failed,
                     AUDIO_PERMISSION_APPLIES,
                 );
@@ -1031,6 +1064,7 @@ impl RenderCallback for VizApp {
                     match shortcut {
                         WindowShortcut::Resize(preset) => {
                             apply_window_size_preset(window, preset, self.window_mode.borderless);
+                            self.size_preset_dirty = true;
                             if let (Some(hook), Some(state)) = (
                                 self.on_window_change.as_mut(),
                                 Self::current_window_state(window),
@@ -1074,6 +1108,16 @@ impl RenderCallback for VizApp {
             WindowEvent::CursorMoved { .. } | WindowEvent::CursorEntered { .. }
         ) {
             self.pointer_moved_since_render = true;
+        }
+
+        // Mark cached size-preset dirty on geometry/scale changes.
+        if matches!(
+            event,
+            WindowEvent::Moved(_)
+                | WindowEvent::Resized(_)
+                | WindowEvent::ScaleFactorChanged { .. }
+        ) {
+            self.size_preset_dirty = true;
         }
 
         // Persist window geometry on move/resize, debounced so a drag does not write
@@ -1121,9 +1165,14 @@ impl RenderCallback for VizApp {
                     ..
                 }
             )
-            && !self.overlay.pointer_over_overlay()
+            && (self.overlay_hidden_settled || !self.overlay.pointer_over_overlay())
         {
             let _ = window.drag_window();
+            return false;
+        }
+
+        if self.overlay_hidden_settled {
+            self.overlay.on_hidden_window_event(window, event);
             return false;
         }
 
@@ -1132,6 +1181,20 @@ impl RenderCallback for VizApp {
 
     fn wants_transparent_clear(&self) -> bool {
         self.window_mode.transparent && self.last_view_active
+    }
+
+    fn owns_surface_clear(&self) -> bool {
+        true
+    }
+
+    fn desired_frame_interval(&self) -> Duration {
+        self.desired_interval
+    }
+
+    fn on_post_submit(&mut self) {
+        if let Some(r) = self.renderer.as_mut() {
+            r.recall_staging();
+        }
     }
 
     fn render(&mut self, frame: &mut FrameContext<'_>) {
@@ -1158,14 +1221,18 @@ impl RenderCallback for VizApp {
         };
 
         // Feature-frame age (wall clock) for the HUD.
-        self.hud.feature_age_ms = self
-            .latest_frame_at
-            .map(|t| Instant::now().saturating_duration_since(t).as_secs_f64() * 1000.0)
-            .unwrap_or(0.0);
+        #[cfg(feature = "perf-hud")]
+        {
+            self.hud.feature_age_ms = self
+                .latest_frame_at
+                .map(|t| Instant::now().saturating_duration_since(t).as_secs_f64() * 1000.0)
+                .unwrap_or(0.0);
+        }
 
-        // Render the scene only in the Active view; the other views leave the dark
-        // clear pass in place and rely on the egui overlay to paint the message
-        // (the window must always explain its state — never a silent black screen).
+        // Render the scene in the Active view (viz-render clears the surface itself
+        // with LoadOp::Clear). For non-Active guidance views (or before GPU attach),
+        // encode the single opaque dark clear pass here so guidance text sits on a
+        // solid background without wasting a redundant clear pass on Active frames.
         if let (AppView::Active, Some(renderer), Some(rt)) =
             (&view, self.renderer.as_mut(), self.runtime.as_mut())
         {
@@ -1211,6 +1278,30 @@ impl RenderCallback for VizApp {
             self.hud.detail_factor = detail;
             self.hud.shed_feedback = shed_feedback;
             self.hud.paused = paused;
+        } else {
+            let _clear = frame
+                .encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("guidance-clear-pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: frame.view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.02,
+                                g: 0.02,
+                                b: 0.03,
+                                a: 1.0,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
         }
 
         // Perf HUD: record this presented frame's timing and snapshot it.
@@ -1222,36 +1313,77 @@ impl RenderCallback for VizApp {
 
         // Stamp the pointer-move timer for overlay auto-hide. Done once per render on
         // the render clock so visibility timing is independent of the input rate.
+        // On the very first rendered frame (when `last_pointer_move` is still `None`),
+        // seed it to `render_now` so the overlay starts visible and still auto-hides
+        // after `AUTO_HIDE_AFTER` even if the cursor never enters the window.
         let render_now = Instant::now();
         if self.pointer_moved_since_render {
             self.pointer_moved_since_render = false;
             self.last_pointer_move = Some(render_now);
         }
-        // Time since the last pointer move; `None` (never moved) ⇒ treat as "just
-        // moved" so the overlay starts visible.
-        let since_move = self
-            .last_pointer_move
-            .map(|t| render_now.saturating_duration_since(t))
-            .unwrap_or(Duration::ZERO);
+        let last_move = *self.last_pointer_move.get_or_insert(render_now);
+        let since_move = render_now.saturating_duration_since(last_move);
         // The overlay is interactive: while the pointer is over a visible panel we
         // keep it shown so a dropdown/settings interaction is never yanked away.
-        let pointer_over_overlay = self.overlay.pointer_over_overlay();
+        // Short-circuit: before AUTO_HIDE_AFTER elapses `decide_visibility` always
+        // returns `show = true`, and once auto-hidden settled there is no visible panel.
+        let pointer_over_overlay =
+            if !self.overlay_hidden_settled && since_move >= crate::overlay::AUTO_HIDE_AFTER {
+                self.overlay.pointer_over_overlay()
+            } else {
+                false
+            };
         let vis = decide_visibility(since_move, pointer_over_overlay, self.collapsed);
 
+        // Compute desired pacing cadence for the next frame:
+        // - Static guidance screens run at 8 Hz (waking immediately on input).
+        // - Active view during sustained silence with hidden overlay steps down to 20 Hz.
+        // - Active view with audio or visible overlay runs at full 60 Hz.
+        if feature.silence {
+            self.silent_since.get_or_insert(render_now);
+        } else {
+            self.silent_since = None;
+        }
+        self.desired_interval = if !matches!(view, AppView::Active) {
+            STATIC_VIEW_FRAME_INTERVAL
+        } else if !vis.show
+            && self
+                .silent_since
+                .is_some_and(|s| render_now.saturating_duration_since(s) >= SILENCE_THROTTLE_AFTER)
+        {
+            SILENT_FRAME_INTERVAL
+        } else {
+            crate::window::MIN_FRAME_INTERVAL
+        };
+
+        // Fast bypass: once the auto-hidden Active overlay has run one clean hide
+        // frame (clearing egui areas + cursor), skip egui entirely until wake.
+        let can_skip_overlay =
+            matches!(view, AppView::Active) && !vis.show && !cfg!(feature = "perf-hud");
+        if can_skip_overlay && self.overlay_hidden_settled {
+            return;
+        }
+
+        // Recompute the matching window size preset lazily — only when dirty AND the
+        // expanded panel is actually visible (avoids 60 Hz AppKit/CoreGraphics IPC).
+        if self.size_preset_dirty && matches!(view, AppView::Active) && vis.show && !vis.collapsed {
+            let inner_logical: winit::dpi::LogicalSize<f64> = frame
+                .window
+                .inner_size()
+                .to_logical(frame.window.scale_factor());
+            let monitor_logical = frame.window.current_monitor().map(|mon| {
+                let sz: winit::dpi::LogicalSize<f64> = mon.size().to_logical(mon.scale_factor());
+                (sz.width, sz.height)
+            });
+            self.cached_size_preset = detect_size_preset(
+                (inner_logical.width, inner_logical.height),
+                frame.window.is_maximized(),
+                monitor_logical,
+            );
+            self.size_preset_dirty = false;
+        }
+
         // Update the overlay model, then paint the egui overlay on top.
-        let inner_logical: winit::dpi::LogicalSize<f64> = frame
-            .window
-            .inner_size()
-            .to_logical(frame.window.scale_factor());
-        let monitor_logical = frame.window.current_monitor().map(|mon| {
-            let sz: winit::dpi::LogicalSize<f64> = mon.size().to_logical(mon.scale_factor());
-            (sz.width, sz.height)
-        });
-        let active_size_preset = detect_size_preset(
-            (inner_logical.width, inner_logical.height),
-            frame.window.is_maximized(),
-            monitor_logical,
-        );
         {
             let mut model = self.model.borrow_mut();
             model.view = ViewSnapshot::from(&view);
@@ -1266,7 +1398,7 @@ impl RenderCallback for VizApp {
             model.collapsed = vis.collapsed;
             model.show_overlay = vis.show;
             model.window_mode = self.window_mode;
-            model.active_size_preset = active_size_preset;
+            model.active_size_preset = self.cached_size_preset;
             model.request = OverlayRequest::default();
             #[cfg(feature = "perf-hud")]
             {
@@ -1274,6 +1406,7 @@ impl RenderCallback for VizApp {
             }
         }
         self.overlay.render(frame);
+        self.overlay_hidden_settled = can_skip_overlay;
 
         // Drain any user action the overlay closure recorded this frame and apply it
         // (the closure cannot borrow `self` mutably, so it queues into the model).
@@ -1303,6 +1436,7 @@ impl RenderCallback for VizApp {
             }
             if let Some(preset) = req.set_size_preset {
                 apply_window_size_preset(frame.window, preset, self.window_mode.borderless);
+                self.size_preset_dirty = true;
                 // Persist immediately for synchronous resizes and clear the debounce
                 // timer so any ensuing async `Resized` event also persists cleanly.
                 if let (Some(hook), Some(state)) = (
@@ -1482,23 +1616,26 @@ fn render_panel_body(ui: &mut egui::Ui, model: &mut OverlayModel) {
             }
 
             // The current selection's display name (falls back to the id, then a prompt).
-            let selected_label = model
+            let selected_label: &str = model
                 .active_id
                 .as_ref()
                 .and_then(|id| model.entries.iter().find(|e| &e.id == id))
-                .map(|e| e.name.clone())
-                .unwrap_or_else(|| "Select artifact".to_owned());
+                .map(|e| e.name.as_str())
+                .unwrap_or("Select artifact");
 
             ui.horizontal(|ui| {
+                let entries = &model.entries;
+                let active_id = &model.active_id;
+                let request = &mut model.request;
                 egui::ComboBox::from_id_salt("artifact-dropdown")
                     .selected_text(selected_label)
                     .show_ui(ui, |ui| {
-                        for entry in &model.entries {
-                            let is_active = model.active_id.as_ref() == Some(&entry.id);
+                        for entry in entries {
+                            let is_active = active_id.as_ref() == Some(&entry.id);
                             // `selectable_label` returns a click response; on click we
                             // *request* the switch — VizApp applies it after the egui pass.
                             if ui.selectable_label(is_active, &entry.name).clicked() && !is_active {
-                                model.request.select = Some(entry.id.clone());
+                                request.select = Some(entry.id.clone());
                             }
                         }
                     })
@@ -1512,7 +1649,7 @@ fn render_panel_body(ui: &mut egui::Ui, model: &mut OverlayModel) {
                     .on_hover_text("Reload artifacts (re-scan the artifacts folder)")
                     .clicked()
                 {
-                    model.request.reload_artifacts = true;
+                    request.reload_artifacts = true;
                 }
             });
 

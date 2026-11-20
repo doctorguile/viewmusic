@@ -20,7 +20,9 @@
 //! `x`/`y`. The local coordinate is forwarded so the fragment shader can mask circle and
 //! triangle shapes. Colors are premultiplied in the shader before blending.
 
-use wgpu::util::DeviceExt;
+use std::num::NonZeroU64;
+
+use wgpu::util::{DeviceExt, StagingBelt};
 
 use crate::{BlendMode, InstanceData, ShapeKind, MAX_INSTANCES};
 
@@ -170,7 +172,8 @@ impl InstancedPipelines {
     /// runtime already clamps to 4096). Empty layers are skipped (zero draw).
     pub fn push(
         &mut self,
-        queue: &wgpu::Queue,
+        belt: &mut StagingBelt,
+        encoder: &mut wgpu::CommandEncoder,
         shape: ShapeKind,
         blend: BlendMode,
         instances: &[InstanceData],
@@ -184,11 +187,11 @@ impl InstancedPipelines {
         let base = self.cursor;
         if take > 0 {
             let offset = base as u64 * std::mem::size_of::<InstanceData>() as u64;
-            queue.write_buffer(
-                &self.instances,
-                offset,
-                bytemuck::cast_slice(&instances[..take]),
-            );
+            let bytes = bytemuck::cast_slice(&instances[..take]);
+            if let Some(size) = NonZeroU64::new(bytes.len() as u64) {
+                belt.write_buffer(encoder, &self.instances, offset, size)
+                    .copy_from_slice(bytes);
+            }
         }
         self.records[self.len] = LayerRecord {
             shape,

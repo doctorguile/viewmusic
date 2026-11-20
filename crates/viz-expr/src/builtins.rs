@@ -19,7 +19,7 @@ pub struct BuiltinFn {
 
 /// The set of built-in function operations. Listed in arity-agnostic order; the
 /// VM `match` pops the corresponding number of operands.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BuiltinOp {
     Sin,
     Cos,
