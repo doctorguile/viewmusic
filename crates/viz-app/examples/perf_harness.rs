@@ -465,7 +465,7 @@ impl Gpu {
         let required_limits = wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits());
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("perf-harness-device"),
-            required_features: features,
+            required_features: features | viz_render::device_features(&adapter),
             required_limits,
             ..Default::default()
         }))

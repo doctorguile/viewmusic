@@ -21,9 +21,11 @@
 
 use std::num::NonZeroU64;
 
-use wgpu::util::StagingBelt;
-
+use crate::upload::{cached_bind_group, Uploader};
 use crate::{PassTargets, CLEAR_COLOR, CLEAR_COLOR_TRANSPARENT};
+
+/// Size of the decay uniform: one f32, padded to 16 bytes (uniform alignment).
+const DECAY_BYTES: NonZeroU64 = NonZeroU64::new(16).unwrap();
 
 /// Two-texture ping-pong accumulator + the fullscreen decay pipeline.
 ///
@@ -44,10 +46,16 @@ pub struct Feedback {
     /// Pipeline that multiplies the sampled texture by a decay uniform, writing both
     /// attachments of the feedback pass (`curr` and the surface).
     decay_pipeline: wgpu::RenderPipeline,
-    /// Uniform holding the current `decay` factor (one f32, padded to 16 bytes).
-    decay_uniform: wgpu::Buffer,
-    /// Bind group for the decay uniform.
-    decay_uniform_bind: wgpu::BindGroup,
+    decay_uniform_layout: wgpu::BindGroupLayout,
+    /// Copy destination for the decay uniform; `None` when the draw binds the upload
+    /// chunk directly.
+    decay_copy_target: Option<wgpu::Buffer>,
+    /// Decay uniform bind group per buffer that has held the decay value.
+    decay_bind_groups: Vec<(wgpu::Buffer, wgpu::BindGroup)>,
+    /// This frame's decay bind group (index into `decay_bind_groups`) and its offset.
+    decay_bind: (usize, u32),
+    /// Uniform offset alignment, for direct decay uploads.
+    uniform_align: NonZeroU64,
 
     /// Set after (re)allocation or background-mode toggle: both accumulators must be
     /// cleared before they are first sampled. Cleared lazily at the start of the next
@@ -57,17 +65,19 @@ pub struct Feedback {
     /// Tracks the previous `transparent_bg` mode so toggling transparency marks the
     /// accumulators dirty and clears them cleanly to the new background color.
     last_transparent: bool,
-    /// Cached decay uniform value so unchanged decay scalars skip `queue.write_buffer`.
+    /// Decay value in `decay_copy_target`, so an unchanged decay skips the copy.
     last_decay: Option<f32>,
 }
 
 impl Feedback {
-    /// Builds the pipelines, sampler, and the two accumulator textures at `width × height`.
+    /// Builds the pipelines, sampler, and the two accumulator textures at `width × height`
+    /// (and the decay copy target unless uploads are `direct`).
     pub fn new(
         device: &wgpu::Device,
         format: wgpu::TextureFormat,
         width: u32,
         height: u32,
+        direct: bool,
     ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("feedback-shader"),
@@ -113,27 +123,24 @@ impl Feedback {
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                        has_dynamic_offset: true,
+                        min_binding_size: Some(DECAY_BYTES),
                     },
                     count: None,
                 }],
             });
 
-        let decay_uniform = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("feedback-decay-uniform"),
-            size: 16, // one f32, padded to 16 bytes (uniform alignment).
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
+        let decay_copy_target = (!direct).then(|| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("feedback-decay-uniform"),
+                size: DECAY_BYTES.get(),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
         });
-        let decay_uniform_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("feedback-decay-uniform-bind"),
-            layout: &decay_uniform_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: decay_uniform.as_entire_binding(),
-            }],
-        });
+        let uniform_align =
+            NonZeroU64::new(device.limits().min_uniform_buffer_offset_alignment.into())
+                .expect("non-zero uniform offset alignment");
 
         let decay_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("feedback-decay-pipeline-layout"),
@@ -183,8 +190,11 @@ impl Feedback {
             sampler,
             bind_layout,
             decay_pipeline,
-            decay_uniform,
-            decay_uniform_bind,
+            decay_uniform_layout,
+            decay_copy_target,
+            decay_bind_groups: Vec::new(),
+            decay_bind: (0, 0),
+            uniform_align,
             dirty: true,
             last_transparent: false,
             last_decay: None,
@@ -339,27 +349,50 @@ impl Feedback {
     pub fn draw_decay<'p>(&'p self, pass: &mut wgpu::RenderPass<'p>) {
         pass.set_pipeline(&self.decay_pipeline);
         pass.set_bind_group(0, &self.sample_bind[self.prev], &[]);
-        pass.set_bind_group(1, &self.decay_uniform_bind, &[]);
+        let (bind_group, offset) = self.decay_bind;
+        pass.set_bind_group(1, &self.decay_bind_groups[bind_group].1, &[offset]);
         pass.draw(0..3, 0..1);
     }
 
-    /// Writes the decay scalar into the uniform only when it changed since last frame.
+    /// Uploads the decay scalar for this frame's [`Feedback::draw_decay`]. The copy path
+    /// skips an unchanged value; direct uploads write it every frame into a fresh chunk.
     pub fn set_decay(
         &mut self,
-        belt: &mut StagingBelt,
+        device: &wgpu::Device,
+        upload: &mut Uploader,
         encoder: &mut wgpu::CommandEncoder,
         decay: f32,
     ) {
         let clamped = decay.clamp(0.0, 0.99);
-        if self.last_decay == Some(clamped) {
+        if self.decay_copy_target.is_some() && self.last_decay == Some(clamped) {
             return;
         }
         let v = [clamped, 0.0, 0.0, 0.0];
-        let bytes = bytemuck::cast_slice(&v);
-        if let Some(size) = NonZeroU64::new(bytes.len() as u64) {
-            belt.write_buffer(encoder, &self.decay_uniform, 0, size)
-                .copy_from_slice(bytes);
-        }
+        let (mut view, buffer, offset) = upload.write(
+            encoder,
+            self.decay_copy_target.as_ref(),
+            0,
+            DECAY_BYTES,
+            self.uniform_align,
+        );
+        view.copy_from_slice(bytemuck::cast_slice(&v));
+        drop(view);
+        let layout = &self.decay_uniform_layout;
+        let bind_group = cached_bind_group(&mut self.decay_bind_groups, &buffer, |buffer| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("feedback-decay-uniform-bind"),
+                layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer,
+                        offset: 0,
+                        size: Some(DECAY_BYTES),
+                    }),
+                }],
+            })
+        });
+        self.decay_bind = (bind_group, offset as u32);
         self.last_decay = Some(clamped);
     }
 

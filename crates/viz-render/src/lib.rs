@@ -15,10 +15,12 @@
 //! both behave.
 //!
 //! ## Real-time discipline
-//! Every GPU buffer is pre-allocated at construction to its contract maximum
-//! ([`MAX_INSTANCES`], [`MAX_POINTS`], [`MAX_FIELD_CELLS`]). The per-frame path only
-//! calls [`wgpu::Queue::write_buffer`] into those buffers — never creates or grows
-//! them. No heap allocation, no locks, no blocking I/O in [`Renderer::render`].
+//! Per-frame layer data goes through a reusable staging belt (see [`upload`]). With
+//! [`device_features`] enabled on a unified-memory GPU the draws bind the belt's mapped
+//! chunks directly and a frame records no copy commands; otherwise the belt copies into
+//! buffers pre-allocated to the contract maxima ([`MAX_INSTANCES`], [`MAX_POINTS`],
+//! [`MAX_FIELD_CELLS`]). In steady state no buffers are created, and there is no heap
+//! allocation, no lock, and no blocking I/O in [`Renderer::render`].
 //!
 //! ## Module map
 //! - [`instanced`]: instanced quads with rect/circle/triangle masking, two blends.
@@ -26,14 +28,29 @@
 //! - [`field`]: resolution×resolution color grid as instanced cell quads.
 //! - [`feedback`]: persistent decay/trails accumulator (rendered alongside the surface).
 //! - [`degrade`]: pure adaptive-detail / pause ladder logic (no GPU).
+//! - [`upload`]: per-frame upload of layer data (direct-bound or copied).
 
 mod degrade;
 mod feedback;
 mod field;
 mod instanced;
 mod polyline;
+mod upload;
 
 pub use degrade::DegradeController;
+
+/// Optional device features the renderer uses; request them in `request_device`.
+///
+/// On a unified-memory GPU, [`wgpu::Features::MAPPABLE_PRIMARY_BUFFERS`] lets the draws
+/// bind the mapped upload buffers directly, so frames record no copy commands. It is not
+/// requested on discrete GPUs, where mapped buffers live across the bus.
+pub fn device_features(adapter: &wgpu::Adapter) -> wgpu::Features {
+    if adapter.get_info().device_type == wgpu::DeviceType::IntegratedGpu {
+        adapter.features() & wgpu::Features::MAPPABLE_PRIMARY_BUFFERS
+    } else {
+        wgpu::Features::empty()
+    }
+}
 
 /// Maximum instances per `instanced` layer (contract §12: 4096).
 pub const MAX_INSTANCES: usize = 4096;
@@ -271,15 +288,9 @@ pub struct Renderer {
     polyline: polyline::PolylinePipelines,
     field: field::FieldPipelines,
     feedback: feedback::Feedback,
-    /// Reusable mapped staging buffers so steady-state geometry uploads avoid
-    /// per-frame `queue.write_buffer` kernel buffer allocations and extra Metal
-    /// staging command buffers.
-    staging_belt: wgpu::util::StagingBelt,
+    /// Per-frame upload of layer data through reusable mapped buffers.
+    upload: upload::Uploader,
 }
-
-/// Chunk size for [`Renderer::staging_belt`] (256 KiB comfortably holds a full
-/// typical frame's geometry + uniforms in a single reusable mapped buffer).
-const STAGING_BELT_CHUNK_BYTES: wgpu::BufferAddress = 256 * 1024;
 
 impl Renderer {
     /// Builds the renderer: all pipelines, buffers, and the feedback target.
@@ -295,11 +306,12 @@ impl Renderer {
         // first frame. Feedback allocates lazily to the current size.
         let width = 1;
         let height = 1;
-        let instanced = instanced::InstancedPipelines::new(device, surface_format);
-        let polyline = polyline::PolylinePipelines::new(device, surface_format);
-        let field = field::FieldPipelines::new(device, surface_format);
-        let feedback = feedback::Feedback::new(device, surface_format, width, height);
-        let staging_belt = wgpu::util::StagingBelt::new(device.clone(), STAGING_BELT_CHUNK_BYTES);
+        let upload = upload::Uploader::new(device);
+        let direct = upload.direct();
+        let instanced = instanced::InstancedPipelines::new(device, surface_format, direct);
+        let polyline = polyline::PolylinePipelines::new(device, surface_format, direct);
+        let field = field::FieldPipelines::new(device, surface_format, direct);
+        let feedback = feedback::Feedback::new(device, surface_format, width, height, direct);
         let _ = queue; // queue not needed at construction; kept for API symmetry.
         Self {
             format: surface_format,
@@ -309,14 +321,14 @@ impl Renderer {
             polyline,
             field,
             feedback,
-            staging_belt,
+            upload,
         }
     }
 
     /// Reclaims completed staging chunks after `queue.submit(...)` so the next frame
     /// reuses mapped GPU buffers with zero kernel allocations.
     pub fn recall_staging(&mut self) {
-        self.staging_belt.recall();
+        self.upload.recall();
     }
 
     /// Reallocates size-dependent targets for a new surface size (glitch-free: the
@@ -358,17 +370,17 @@ impl Renderer {
         params: &SceneParams,
         layers: &[LayerDraw],
     ) {
-        let _ = queue; // uploads go through staging_belt.
+        let _ = queue; // uploads go through `self.upload`.
         let surface_size = surface_view.texture().size();
         self.resize(device, surface_size.width, surface_size.height);
 
         // Reclaim any staging chunks whose previous submit finished (safe even if the
         // caller did not invoke `recall_staging` after submit).
-        self.staging_belt.recall();
+        self.upload.recall();
 
-        // Upload all per-layer geometry once, up front, via the reusable StagingBelt
-        // onto our frame encoder (zero per-frame MTLBuffer creation / extra cmd buffer).
-        self.upload(encoder, layers);
+        // Upload all per-layer geometry once, up front (zero per-frame MTLBuffer creation
+        // or extra command buffer).
+        self.upload_layers(device, encoder, layers);
 
         let clear_color = if params.transparent_bg {
             CLEAR_COLOR_TRANSPARENT
@@ -407,7 +419,7 @@ impl Renderer {
             Some(decay) => {
                 // Queue the decay scalar (cached) before recording the pass that reads it.
                 self.feedback
-                    .set_decay(&mut self.staging_belt, encoder, decay);
+                    .set_decay(device, &mut self.upload, encoder, decay);
                 // Clear accumulators lazily if resized, bypassed, or transparency toggled.
                 self.feedback.prepare_frame(encoder, params.transparent_bg);
                 // One pass draws `prev * decay` fullscreen AND all layers into both `curr`
@@ -446,12 +458,16 @@ impl Renderer {
         }
 
         // Unmap active staging chunks before the caller submits `encoder.finish()`.
-        self.staging_belt.finish();
+        self.upload.finish();
     }
 
-    /// Uploads all geometry for this frame into the pre-allocated GPU buffers via
-    /// the reusable [`StagingBelt`].
-    fn upload(&mut self, encoder: &mut wgpu::CommandEncoder, layers: &[LayerDraw]) {
+    /// Uploads all geometry for this frame through [`Renderer::upload`].
+    fn upload_layers(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        layers: &[LayerDraw],
+    ) {
         // Reset per-frame draw bookkeeping, then append each layer's data.
         self.instanced.begin_frame();
         self.polyline.begin_frame();
@@ -464,7 +480,7 @@ impl Renderer {
                     instances,
                 } => {
                     self.instanced
-                        .push(&mut self.staging_belt, encoder, *shape, *blend, instances);
+                        .push(&mut self.upload, encoder, *shape, *blend, instances);
                 }
                 LayerDraw::Polyline {
                     blend,
@@ -473,7 +489,7 @@ impl Renderer {
                     points,
                 } => {
                     self.polyline.push(
-                        &mut self.staging_belt,
+                        &mut self.upload,
                         encoder,
                         *blend,
                         *thickness_px,
@@ -488,12 +504,17 @@ impl Renderer {
                     resolution,
                     cells,
                 } => {
-                    self.field
-                        .push(&mut self.staging_belt, encoder, *blend, *resolution, cells);
+                    self.field.push(
+                        device,
+                        &mut self.upload,
+                        encoder,
+                        *blend,
+                        *resolution,
+                        cells,
+                    );
                 }
             }
         }
-        self.field.flush_params(&mut self.staging_belt, encoder);
     }
 
     /// Records draw calls for every layer, in order, into an open render pass.

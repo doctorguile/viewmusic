@@ -12,8 +12,9 @@
 
 use std::num::NonZeroU64;
 
-use wgpu::util::{DeviceExt, StagingBelt};
+use wgpu::util::DeviceExt;
 
+use crate::upload::{Uploader, VERTEX_ALIGN};
 use crate::{BlendMode, PassTargets, PointData, MAX_POINTS};
 
 /// Max polyline layers tracked per frame (contract §12: ≤16 layers per scene).
@@ -39,10 +40,10 @@ struct Segment {
 }
 
 /// One polyline layer recorded this frame.
-#[derive(Clone, Copy)]
 struct LayerRecord {
     blend: BlendMode,
-    base: u32,
+    /// Buffer and byte offset holding the segments; `None` for an empty layer.
+    data: Option<(wgpu::Buffer, wgpu::BufferAddress)>,
     count: u32,
 }
 
@@ -52,12 +53,14 @@ pub struct PolylinePipelines {
     pipelines: [[wgpu::RenderPipeline; 2]; 2],
     /// Static template quad ([0,1] × [-0.5,0.5]) as 6 vertices.
     template: wgpu::Buffer,
-    /// Shared segment instance buffer (capacity `MAX_LAYERS * MAX_POINTS`).
-    segments: wgpu::Buffer,
+    /// Copy destination for segments (capacity `MAX_LAYERS * MAX_POINTS`); `None` when the
+    /// draws bind the upload chunks directly.
+    copy_target: Option<wgpu::Buffer>,
     /// CPU staging for the current layer's segments (pre-allocated, no per-frame alloc).
     staging: Vec<Segment>,
-    records: [LayerRecord; MAX_LAYERS],
-    len: usize,
+    /// Per-frame layer records (capacity `MAX_LAYERS`, reserved up front).
+    records: Vec<LayerRecord>,
+    /// Running write cursor (in segments) into `copy_target` for the current frame.
     cursor: u32,
 }
 
@@ -72,8 +75,9 @@ const TEMPLATE: [[f32; 2]; 6] = [
 ];
 
 impl PolylinePipelines {
-    /// Builds the four pipelines and allocates buffers + CPU staging.
-    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+    /// Builds the four pipelines and allocates buffers + CPU staging (the segment copy
+    /// target only unless uploads are `direct`).
+    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat, direct: bool) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("polyline-shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("polyline.wgsl").into()),
@@ -143,34 +147,38 @@ impl PolylinePipelines {
         let template = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("polyline-template"),
             contents: bytemuck::cast_slice(&TEMPLATE),
-            usage: wgpu::BufferUsages::VERTEX,
+            // MAP_WRITE (direct uploads only) writes the contents in place instead of
+            // through a staging copy, so creating a renderer issues no blit either.
+            usage: wgpu::BufferUsages::VERTEX
+                | if direct {
+                    wgpu::BufferUsages::MAP_WRITE
+                } else {
+                    wgpu::BufferUsages::empty()
+                },
         });
-        let segments = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("polyline-segments"),
-            size: (std::mem::size_of::<Segment>() * MAX_LAYERS * MAX_POINTS) as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
+        let copy_target = (!direct).then(|| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("polyline-segments"),
+                size: (std::mem::size_of::<Segment>() * MAX_LAYERS * MAX_POINTS)
+                    as wgpu::BufferAddress,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
         });
 
-        let zero = LayerRecord {
-            blend: BlendMode::Alpha,
-            base: 0,
-            count: 0,
-        };
         Self {
             pipelines,
             template,
-            segments,
+            copy_target,
             staging: Vec::with_capacity(MAX_POINTS),
-            records: [zero; MAX_LAYERS],
-            len: 0,
+            records: Vec::with_capacity(MAX_LAYERS),
             cursor: 0,
         }
     }
 
     /// Resets per-frame bookkeeping.
     pub fn begin_frame(&mut self) {
-        self.len = 0;
+        self.records.clear();
         self.cursor = 0;
     }
 
@@ -181,7 +189,7 @@ impl PolylinePipelines {
     #[allow(clippy::too_many_arguments)]
     pub fn push(
         &mut self,
-        belt: &mut StagingBelt,
+        upload: &mut Uploader,
         encoder: &mut wgpu::CommandEncoder,
         blend: BlendMode,
         thickness_px: f32,
@@ -190,7 +198,7 @@ impl PolylinePipelines {
         width: u32,
         height: u32,
     ) {
-        if self.len >= MAX_LAYERS {
+        if self.records.len() >= MAX_LAYERS {
             return;
         }
         self.staging.clear();
@@ -231,41 +239,40 @@ impl PolylinePipelines {
             }
         }
 
-        let cap_total = (MAX_LAYERS * MAX_POINTS) as u32;
-        let remaining = cap_total.saturating_sub(self.cursor) as usize;
-        let take = self.staging.len().min(remaining);
-        let base = self.cursor;
-        if take > 0 {
-            let offset = base as u64 * std::mem::size_of::<Segment>() as u64;
-            let bytes = bytemuck::cast_slice(&self.staging[..take]);
-            if let Some(size) = NonZeroU64::new(bytes.len() as u64) {
-                belt.write_buffer(encoder, &self.segments, offset, size)
-                    .copy_from_slice(bytes);
-            }
-        }
-        self.records[self.len] = LayerRecord {
+        let take = self.staging.len();
+        let bytes: &[u8] = bytemuck::cast_slice(&self.staging);
+        let data = NonZeroU64::new(bytes.len() as u64).map(|size| {
+            let copy_offset = self.cursor as u64 * std::mem::size_of::<Segment>() as u64;
+            let (mut view, buffer, offset) = upload.write(
+                encoder,
+                self.copy_target.as_ref(),
+                copy_offset,
+                size,
+                VERTEX_ALIGN,
+            );
+            view.copy_from_slice(bytes);
+            (buffer, offset)
+        });
+        self.records.push(LayerRecord {
             blend,
-            base,
+            data,
             count: take as u32,
-        };
-        self.len += 1;
+        });
         self.cursor += take as u32;
     }
 
     /// Records the draw for the `idx`-th polyline layer pushed this frame.
     pub fn draw<'p>(&'p self, pass: &mut wgpu::RenderPass<'p>, idx: usize, targets: PassTargets) {
-        if idx >= self.len {
+        let Some(rec) = self.records.get(idx) else {
             return;
-        }
-        let rec = self.records[idx];
-        if rec.count == 0 {
+        };
+        let Some((buffer, offset)) = &rec.data else {
             return;
-        }
+        };
         pass.set_pipeline(&self.pipelines[targets.index()][rec.blend.index()]);
         pass.set_vertex_buffer(0, self.template.slice(..));
-        let start = rec.base as u64 * std::mem::size_of::<Segment>() as u64;
-        let end = (rec.base + rec.count) as u64 * std::mem::size_of::<Segment>() as u64;
-        pass.set_vertex_buffer(1, self.segments.slice(start..end));
+        let end = offset + rec.count as u64 * std::mem::size_of::<Segment>() as u64;
+        pass.set_vertex_buffer(1, buffer.slice(*offset..end));
         pass.draw(0..TEMPLATE.len() as u32, 0..rec.count);
     }
 }

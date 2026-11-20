@@ -4,17 +4,20 @@
 //! Cells are uploaded straight from `&[[f32; 4]]` with zero CPU packing loop
 //! (half the upload bytes and 3 vertices instead of `6 * res^2` instanced quads).
 //! Row-major from bottom-left (`i = row * resolution + col`), matching the contract.
+//!
+//! Each layer uploads one region: its [`FieldParams`] in the first `param_stride` bytes
+//! (bound as a dynamic-offset uniform) followed by its cells (read through a storage
+//! binding of the whole buffer, indexed from `params.base`).
 
 use std::num::NonZeroU64;
 
-use wgpu::util::StagingBelt;
-
+use crate::upload::{cached_bind_group, Uploader};
 use crate::{BlendMode, PassTargets, MAX_FIELD_CELLS, MAX_FIELD_RES};
 
 /// Max field layers tracked per frame (contract §12: ≤16 layers per scene).
 const MAX_LAYERS: usize = 16;
 
-/// Per-layer uniform metadata uploaded into a dynamic-offset uniform buffer.
+/// Per-layer uniform metadata at the start of the layer's upload region.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct FieldParams {
@@ -29,32 +32,34 @@ struct FieldParams {
 struct LayerRecord {
     blend: BlendMode,
     count: u32,
+    /// Index into [`FieldPipelines::bind_groups`] for the buffer holding the region.
+    bind_group: usize,
+    /// Byte offset of the layer's region (its params) in that buffer.
     dynamic_offset: u32,
 }
 
-/// Field pipelines (one per pass targets × blend) + shared cell storage buffer + dynamic
-/// params uniform.
+/// Field pipelines (one per pass targets × blend) + per-buffer bind groups.
 pub struct FieldPipelines {
     /// `pipelines[targets][blend]`.
     pipelines: [[wgpu::RenderPipeline; 2]; 2],
-    /// Shared cell color buffer (`[f32; 4]` × `MAX_LAYERS * MAX_FIELD_CELLS`).
-    cells_buf: wgpu::Buffer,
-    /// Dynamic-offset uniform buffer holding `MAX_LAYERS` aligned [`FieldParams`] slots.
-    params_buf: wgpu::Buffer,
-    /// Bind group binding `cells_buf` + `params_buf` (dynamic offset per layer).
-    bind_group: wgpu::BindGroup,
-    /// Aligned byte stride between slots in `params_buf`.
+    bind_layout: wgpu::BindGroupLayout,
+    /// Copy destination holding `MAX_LAYERS` maximal regions; `None` when the draws bind
+    /// the upload chunks directly.
+    copy_target: Option<wgpu::Buffer>,
+    /// Bind group per buffer that has held a region (the copy target, or upload chunks).
+    bind_groups: Vec<(wgpu::Buffer, wgpu::BindGroup)>,
+    /// Bytes reserved for [`FieldParams`] at the start of each region (uniform offset
+    /// alignment).
     param_stride: usize,
-    /// CPU staging for all field layer params this frame (uploaded in one write).
-    params_staging: Vec<u8>,
-    records: [LayerRecord; MAX_LAYERS],
-    len: usize,
-    cursor: u32,
+    /// Per-frame layer records (capacity `MAX_LAYERS`, reserved up front).
+    records: Vec<LayerRecord>,
+    /// Running byte cursor into `copy_target` for the current frame.
+    cursor: u64,
 }
 
 impl FieldPipelines {
-    /// Builds the four pipelines and pre-allocates storage + dynamic uniform buffers.
-    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+    /// Builds the four pipelines (and the region copy target unless uploads are `direct`).
+    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat, direct: bool) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("field-shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("field.wgsl").into()),
@@ -137,60 +142,32 @@ impl FieldPipelines {
             ]
         });
 
-        let cells_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("field-cells"),
-            size: (std::mem::size_of::<[f32; 4]>() * MAX_LAYERS * MAX_FIELD_CELLS)
-                as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("field-params"),
-            size: (param_stride * MAX_LAYERS) as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
+        let copy_target = (!direct).then(|| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("field-regions"),
+                size: ((param_stride + std::mem::size_of::<[f32; 4]>() * MAX_FIELD_CELLS)
+                    * MAX_LAYERS) as wgpu::BufferAddress,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::UNIFORM
+                    | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
         });
 
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("field-bind-group"),
-            layout: &bind_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: cells_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &params_buf,
-                        offset: 0,
-                        size: NonZeroU64::new(param_size as u64),
-                    }),
-                },
-            ],
-        });
-
-        let zero = LayerRecord {
-            blend: BlendMode::Alpha,
-            count: 0,
-            dynamic_offset: 0,
-        };
         Self {
             pipelines,
-            cells_buf,
-            params_buf,
-            bind_group,
+            bind_layout,
+            copy_target,
+            bind_groups: Vec::new(),
             param_stride,
-            params_staging: vec![0u8; param_stride * MAX_LAYERS],
-            records: [zero; MAX_LAYERS],
-            len: 0,
+            records: Vec::with_capacity(MAX_LAYERS),
             cursor: 0,
         }
     }
 
     /// Resets per-frame bookkeeping.
     pub fn begin_frame(&mut self) {
-        self.len = 0;
+        self.records.clear();
         self.cursor = 0;
     }
 
@@ -200,74 +177,96 @@ impl FieldPipelines {
     /// straight-alpha RGBA colors row-major from bottom-left.
     pub fn push(
         &mut self,
-        belt: &mut StagingBelt,
+        device: &wgpu::Device,
+        upload: &mut Uploader,
         encoder: &mut wgpu::CommandEncoder,
         blend: BlendMode,
         resolution: u32,
         cells: &[[f32; 4]],
     ) {
-        if self.len >= MAX_LAYERS {
+        if self.records.len() >= MAX_LAYERS {
             return;
         }
 
         let res = resolution.clamp(2, MAX_FIELD_RES);
         let total = (res * res) as usize;
-        let cap_total = (MAX_LAYERS * MAX_FIELD_CELLS) as u32;
-        let remaining = cap_total.saturating_sub(self.cursor) as usize;
-        let take = cells.len().min(total).min(remaining);
-        let base = self.cursor;
-
-        if take > 0 {
-            let offset = base as u64 * std::mem::size_of::<[f32; 4]>() as u64;
-            let bytes = bytemuck::cast_slice(&cells[..take]);
-            if let Some(size) = NonZeroU64::new(bytes.len() as u64) {
-                belt.write_buffer(encoder, &self.cells_buf, offset, size)
-                    .copy_from_slice(bytes);
-            }
+        let take = cells.len().min(total);
+        if take == 0 {
+            self.records.push(LayerRecord {
+                blend,
+                count: 0,
+                bind_group: 0,
+                dynamic_offset: 0,
+            });
+            return;
         }
 
-        let slot_offset = self.len * self.param_stride;
+        let cell_bytes: &[u8] = bytemuck::cast_slice(&cells[..take]);
+        let stride = self.param_stride as u64;
+        let region = stride + cell_bytes.len() as u64;
+        let (mut view, buffer, offset) = upload.write(
+            encoder,
+            self.copy_target.as_ref(),
+            self.cursor,
+            NonZeroU64::new(region).expect("region holds params"),
+            NonZeroU64::new(stride).expect("non-zero param stride"),
+        );
         let params = FieldParams {
-            base,
+            base: ((offset + stride) / std::mem::size_of::<[f32; 4]>() as u64) as u32,
             count: take as u32,
             res,
             _pad: 0,
         };
-        self.params_staging[slot_offset..slot_offset + std::mem::size_of::<FieldParams>()]
+        view.slice(..std::mem::size_of::<FieldParams>())
             .copy_from_slice(bytemuck::bytes_of(&params));
+        view.slice(self.param_stride..).copy_from_slice(cell_bytes);
+        drop(view);
 
-        self.records[self.len] = LayerRecord {
+        let layout = &self.bind_layout;
+        let bind_group = cached_bind_group(&mut self.bind_groups, &buffer, |buffer| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("field-bind-group"),
+                layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer,
+                            offset: 0,
+                            size: NonZeroU64::new(std::mem::size_of::<FieldParams>() as u64),
+                        }),
+                    },
+                ],
+            })
+        });
+
+        self.records.push(LayerRecord {
             blend,
             count: take as u32,
-            dynamic_offset: slot_offset as u32,
-        };
-        self.len += 1;
-        self.cursor += take as u32;
-    }
-
-    /// Uploads all field-layer param uniforms recorded this frame in a single write.
-    pub fn flush_params(&self, belt: &mut StagingBelt, encoder: &mut wgpu::CommandEncoder) {
-        if self.len == 0 {
-            return;
-        }
-        let bytes = &self.params_staging[..self.len * self.param_stride];
-        if let Some(size) = NonZeroU64::new(bytes.len() as u64) {
-            belt.write_buffer(encoder, &self.params_buf, 0, size)
-                .copy_from_slice(bytes);
-        }
+            bind_group,
+            dynamic_offset: offset as u32,
+        });
+        self.cursor += region.next_multiple_of(stride);
     }
 
     /// Records the draw for the `idx`-th field layer pushed this frame (3 vertices).
     pub fn draw<'p>(&'p self, pass: &mut wgpu::RenderPass<'p>, idx: usize, targets: PassTargets) {
-        if idx >= self.len {
+        let Some(&rec) = self.records.get(idx) else {
             return;
-        }
-        let rec = self.records[idx];
+        };
         if rec.count == 0 {
             return;
         }
         pass.set_pipeline(&self.pipelines[targets.index()][rec.blend as usize]);
-        pass.set_bind_group(0, &self.bind_group, &[rec.dynamic_offset]);
+        pass.set_bind_group(
+            0,
+            &self.bind_groups[rec.bind_group].1,
+            &[rec.dynamic_offset],
+        );
         pass.draw(0..3, 0..1);
     }
 }

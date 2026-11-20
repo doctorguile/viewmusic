@@ -23,8 +23,9 @@
 
 use std::num::NonZeroU64;
 
-use wgpu::util::{DeviceExt, StagingBelt};
+use wgpu::util::DeviceExt;
 
+use crate::upload::{Uploader, VERTEX_ALIGN};
 use crate::{BlendMode, InstanceData, PassTargets, ShapeKind, MAX_INSTANCES};
 
 /// Max instanced layers we track per frame (contract §12: 16 layers per scene; even if
@@ -42,12 +43,11 @@ const QUAD: [[f32; 2]; 6] = [
 ];
 
 /// One instanced layer recorded this frame: where its data sits and how to draw it.
-#[derive(Clone, Copy)]
 struct LayerRecord {
     shape: ShapeKind,
     blend: BlendMode,
-    /// First instance index into the shared instance buffer.
-    base: u32,
+    /// Buffer and byte offset holding the instances; `None` for an empty layer.
+    data: Option<(wgpu::Buffer, wgpu::BufferAddress)>,
     /// Instance count.
     count: u32,
 }
@@ -58,18 +58,19 @@ pub struct InstancedPipelines {
     pipelines: [[[wgpu::RenderPipeline; 2]; 3]; 2],
     /// Static unit-quad vertex buffer.
     quad: wgpu::Buffer,
-    /// Shared instance buffer, capacity `MAX_LAYERS * MAX_INSTANCES`.
-    instances: wgpu::Buffer,
-    /// Per-frame layer records (fixed-size; `len` tracks how many are live).
-    records: [LayerRecord; MAX_LAYERS],
-    len: usize,
-    /// Running write cursor (in instances) into the shared buffer for the current frame.
+    /// Copy destination for instances (capacity `MAX_LAYERS * MAX_INSTANCES`); `None` when
+    /// the draws bind the upload chunks directly.
+    copy_target: Option<wgpu::Buffer>,
+    /// Per-frame layer records (capacity `MAX_LAYERS`, reserved up front).
+    records: Vec<LayerRecord>,
+    /// Running write cursor (in instances) into `copy_target` for the current frame.
     cursor: u32,
 }
 
 impl InstancedPipelines {
-    /// Builds the 12 pipelines and allocates the static quad + shared instance buffer.
-    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+    /// Builds the 12 pipelines and allocates the static quad (+ the instance copy target
+    /// unless uploads are `direct`).
+    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat, direct: bool) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("instanced-shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("instanced.wgsl").into()),
@@ -138,90 +139,91 @@ impl InstancedPipelines {
         let quad = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("instanced-quad"),
             contents: bytemuck::cast_slice(&QUAD),
-            usage: wgpu::BufferUsages::VERTEX,
+            // MAP_WRITE (direct uploads only) writes the contents in place instead of
+            // through a staging copy, so creating a renderer issues no blit either.
+            usage: wgpu::BufferUsages::VERTEX
+                | if direct {
+                    wgpu::BufferUsages::MAP_WRITE
+                } else {
+                    wgpu::BufferUsages::empty()
+                },
         });
 
-        let instances = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("instanced-data"),
-            size: (std::mem::size_of::<InstanceData>() * MAX_LAYERS * MAX_INSTANCES)
-                as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
+        let copy_target = (!direct).then(|| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("instanced-data"),
+                size: (std::mem::size_of::<InstanceData>() * MAX_LAYERS * MAX_INSTANCES)
+                    as wgpu::BufferAddress,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
         });
 
-        let zero = LayerRecord {
-            shape: ShapeKind::Rect,
-            blend: BlendMode::Alpha,
-            base: 0,
-            count: 0,
-        };
         Self {
             pipelines,
             quad,
-            instances,
-            records: [zero; MAX_LAYERS],
-            len: 0,
+            copy_target,
+            records: Vec::with_capacity(MAX_LAYERS),
             cursor: 0,
         }
     }
 
     /// Resets per-frame bookkeeping. Call once before pushing this frame's layers.
     pub fn begin_frame(&mut self) {
-        self.len = 0;
+        self.records.clear();
         self.cursor = 0;
     }
 
     /// Uploads one instanced layer's data and records how to draw it.
     ///
-    /// Slices longer than the remaining capacity are truncated (defence in depth; the
-    /// runtime already clamps to 4096). Empty layers are skipped (zero draw).
+    /// Slices longer than [`MAX_INSTANCES`] are truncated (defence in depth; the runtime
+    /// already clamps to 4096). Empty layers are skipped (zero draw).
     pub fn push(
         &mut self,
-        belt: &mut StagingBelt,
+        upload: &mut Uploader,
         encoder: &mut wgpu::CommandEncoder,
         shape: ShapeKind,
         blend: BlendMode,
         instances: &[InstanceData],
     ) {
-        if self.len >= MAX_LAYERS {
+        if self.records.len() >= MAX_LAYERS {
             return;
         }
-        let cap_total = (MAX_LAYERS * MAX_INSTANCES) as u32;
-        let remaining = cap_total.saturating_sub(self.cursor) as usize;
-        let take = instances.len().min(MAX_INSTANCES).min(remaining);
-        let base = self.cursor;
-        if take > 0 {
-            let offset = base as u64 * std::mem::size_of::<InstanceData>() as u64;
-            let bytes = bytemuck::cast_slice(&instances[..take]);
-            if let Some(size) = NonZeroU64::new(bytes.len() as u64) {
-                belt.write_buffer(encoder, &self.instances, offset, size)
-                    .copy_from_slice(bytes);
-            }
-        }
-        self.records[self.len] = LayerRecord {
+        let take = instances.len().min(MAX_INSTANCES);
+        let bytes: &[u8] = bytemuck::cast_slice(&instances[..take]);
+        let data = NonZeroU64::new(bytes.len() as u64).map(|size| {
+            let copy_offset = self.cursor as u64 * std::mem::size_of::<InstanceData>() as u64;
+            let (mut view, buffer, offset) = upload.write(
+                encoder,
+                self.copy_target.as_ref(),
+                copy_offset,
+                size,
+                VERTEX_ALIGN,
+            );
+            view.copy_from_slice(bytes);
+            (buffer, offset)
+        });
+        self.records.push(LayerRecord {
             shape,
             blend,
-            base,
+            data,
             count: take as u32,
-        };
-        self.len += 1;
+        });
         self.cursor += take as u32;
     }
 
     /// Records the draw for the `idx`-th instanced layer pushed this frame.
     pub fn draw<'p>(&'p self, pass: &mut wgpu::RenderPass<'p>, idx: usize, targets: PassTargets) {
-        if idx >= self.len {
+        let Some(rec) = self.records.get(idx) else {
             return;
-        }
-        let rec = self.records[idx];
-        if rec.count == 0 {
+        };
+        let Some((buffer, offset)) = &rec.data else {
             return;
-        }
+        };
         pass.set_pipeline(&self.pipelines[targets.index()][rec.shape.index()][rec.blend.index()]);
         pass.set_vertex_buffer(0, self.quad.slice(..));
-        let start = rec.base as u64 * std::mem::size_of::<InstanceData>() as u64;
-        let end = (rec.base + rec.count) as u64 * std::mem::size_of::<InstanceData>() as u64;
-        pass.set_vertex_buffer(1, self.instances.slice(start..end));
+        let end = offset + rec.count as u64 * std::mem::size_of::<InstanceData>() as u64;
+        pass.set_vertex_buffer(1, buffer.slice(*offset..end));
         pass.draw(0..QUAD.len() as u32, 0..rec.count);
     }
 }

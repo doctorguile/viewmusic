@@ -102,7 +102,7 @@ impl GpuContext {
         let required_limits = wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits());
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("viewmusic-device"),
-            required_features: wgpu::Features::empty(),
+            required_features: viz_render::device_features(&adapter),
             required_limits,
             ..Default::default()
         }))
