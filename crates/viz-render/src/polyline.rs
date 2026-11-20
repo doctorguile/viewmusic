@@ -14,7 +14,7 @@ use std::num::NonZeroU64;
 
 use wgpu::util::{DeviceExt, StagingBelt};
 
-use crate::{BlendMode, PointData, MAX_POINTS};
+use crate::{BlendMode, PassTargets, PointData, MAX_POINTS};
 
 /// Max polyline layers tracked per frame (contract §12: ≤16 layers per scene).
 const MAX_LAYERS: usize = 16;
@@ -46,9 +46,10 @@ struct LayerRecord {
     count: u32,
 }
 
-/// Polyline pipelines (one per blend) + the shared segment instance buffer.
+/// Polyline pipelines (one per pass targets × blend) + the shared segment instance buffer.
 pub struct PolylinePipelines {
-    pipelines: [wgpu::RenderPipeline; 2],
+    /// `pipelines[targets][blend]`.
+    pipelines: [[wgpu::RenderPipeline; 2]; 2],
     /// Static template quad ([0,1] × [-0.5,0.5]) as 6 vertices.
     template: wgpu::Buffer,
     /// Shared segment instance buffer (capacity `MAX_LAYERS * MAX_POINTS`).
@@ -71,7 +72,7 @@ const TEMPLATE: [[f32; 2]; 6] = [
 ];
 
 impl PolylinePipelines {
-    /// Builds the two pipelines and allocates buffers + CPU staging.
+    /// Builds the four pipelines and allocates buffers + CPU staging.
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("polyline-shader"),
@@ -101,7 +102,7 @@ impl PolylinePipelines {
             ],
         };
 
-        let make = |blend: BlendMode| {
+        let make = |targets: PassTargets, blend: BlendMode| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("polyline-pipeline"),
                 layout: Some(&layout),
@@ -119,20 +120,25 @@ impl PolylinePipelines {
                 multisample: wgpu::MultisampleState::default(),
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
-                    entry_point: Some("fs_main"),
+                    entry_point: Some(["fs_main", "fs_main_mrt"][targets.index()]),
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
+                    targets: &targets.color_targets(wgpu::ColorTargetState {
                         format,
                         blend: Some(blend.state()),
                         write_mask: wgpu::ColorWrites::ALL,
-                    })],
+                    }),
                 }),
                 multiview_mask: None,
                 cache: None,
             })
         };
 
-        let pipelines = [make(BlendMode::Alpha), make(BlendMode::Add)];
+        let pipelines = PassTargets::ALL.map(|targets| {
+            [
+                make(targets, BlendMode::Alpha),
+                make(targets, BlendMode::Add),
+            ]
+        });
 
         let template = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("polyline-template"),
@@ -247,7 +253,7 @@ impl PolylinePipelines {
     }
 
     /// Records the draw for the `idx`-th polyline layer pushed this frame.
-    pub fn draw<'p>(&'p self, pass: &mut wgpu::RenderPass<'p>, idx: usize) {
+    pub fn draw<'p>(&'p self, pass: &mut wgpu::RenderPass<'p>, idx: usize, targets: PassTargets) {
         if idx >= self.len {
             return;
         }
@@ -255,7 +261,7 @@ impl PolylinePipelines {
         if rec.count == 0 {
             return;
         }
-        pass.set_pipeline(&self.pipelines[rec.blend.index()]);
+        pass.set_pipeline(&self.pipelines[targets.index()][rec.blend.index()]);
         pass.set_vertex_buffer(0, self.template.slice(..));
         let start = rec.base as u64 * std::mem::size_of::<Segment>() as u64;
         let end = (rec.base + rec.count) as u64 * std::mem::size_of::<Segment>() as u64;

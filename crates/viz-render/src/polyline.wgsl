@@ -41,8 +41,24 @@ fn vs_main(
     return out;
 }
 
+// Premultiply straight-alpha for the blend states.
+fn shade(in: VsOut) -> vec4<f32> {
+    return vec4<f32>(in.color.rgb * in.color.a, in.color.a);
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    // Premultiply straight-alpha for the blend states.
-    return vec4<f32>(in.color.rgb * in.color.a, in.color.a);
+    return shade(in);
+}
+
+// Feedback path: the accumulator (location 0) and the surface (location 1) get the same color.
+struct FeedbackOut {
+    @location(0) accum: vec4<f32>,
+    @location(1) surface: vec4<f32>,
+};
+
+@fragment
+fn fs_main_mrt(in: VsOut) -> FeedbackOut {
+    let c = shade(in);
+    return FeedbackOut(c, c);
 }

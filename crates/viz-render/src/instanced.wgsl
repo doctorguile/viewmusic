@@ -45,14 +45,12 @@ fn premul(c: vec4<f32>) -> vec4<f32> {
     return vec4<f32>(c.rgb * c.a, c.a);
 }
 
-@fragment
-fn fs_rect(in: VsOut) -> @location(0) vec4<f32> {
+fn rect(in: VsOut) -> vec4<f32> {
     // Whole quad is filled.
     return premul(in.color);
 }
 
-@fragment
-fn fs_circle(in: VsOut) -> @location(0) vec4<f32> {
+fn circle(in: VsOut) -> vec4<f32> {
     // Inscribed circle: discard fragments outside radius 0.5 of the local quad.
     if (dot(in.local, in.local) > 0.25) {
         discard;
@@ -60,8 +58,7 @@ fn fs_circle(in: VsOut) -> @location(0) vec4<f32> {
     return premul(in.color);
 }
 
-@fragment
-fn fs_triangle(in: VsOut) -> @location(0) vec4<f32> {
+fn triangle(in: VsOut) -> vec4<f32> {
     // Upward isoceles triangle inscribed in the quad: apex at local (0, +0.5),
     // base from (-0.5, -0.5) to (+0.5, -0.5). Keep fragments inside the two slanted
     // edges (the base edge is the quad bottom, already inside).
@@ -76,4 +73,43 @@ fn fs_triangle(in: VsOut) -> @location(0) vec4<f32> {
         discard;
     }
     return premul(in.color);
+}
+
+@fragment
+fn fs_rect(in: VsOut) -> @location(0) vec4<f32> {
+    return rect(in);
+}
+
+@fragment
+fn fs_circle(in: VsOut) -> @location(0) vec4<f32> {
+    return circle(in);
+}
+
+@fragment
+fn fs_triangle(in: VsOut) -> @location(0) vec4<f32> {
+    return triangle(in);
+}
+
+// Feedback path: the accumulator (location 0) and the surface (location 1) get the same color.
+struct FeedbackOut {
+    @location(0) accum: vec4<f32>,
+    @location(1) surface: vec4<f32>,
+};
+
+@fragment
+fn fs_rect_mrt(in: VsOut) -> FeedbackOut {
+    let c = rect(in);
+    return FeedbackOut(c, c);
+}
+
+@fragment
+fn fs_circle_mrt(in: VsOut) -> FeedbackOut {
+    let c = circle(in);
+    return FeedbackOut(c, c);
+}
+
+@fragment
+fn fs_triangle_mrt(in: VsOut) -> FeedbackOut {
+    let c = triangle(in);
+    return FeedbackOut(c, c);
 }

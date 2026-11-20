@@ -1,8 +1,8 @@
-// feedback: fullscreen triangle + decay multiply / straight blit.
+// feedback: fullscreen triangle + decay multiply.
 //
 // vs_fullscreen emits a single oversized triangle covering the viewport using only the
-// vertex index (no vertex buffer). fs_decay samples the previous accumulator and scales
-// it by `decay`. fs_blit copies the accumulator through unchanged.
+// vertex index (no vertex buffer). fs_decay samples the previous accumulator, scales it
+// by `decay`, and writes the result to both the new accumulator and the surface.
 
 struct VsOut {
     @builtin(position) clip: vec4<f32>,
@@ -33,13 +33,13 @@ struct Decay {
 };
 @group(1) @binding(0) var<uniform> decay: Decay;
 
-@fragment
-fn fs_decay(in: VsOut) -> @location(0) vec4<f32> {
-    let c = textureSample(src_tex, src_sampler, in.uv);
-    return c * decay.factor;
-}
+struct FeedbackOut {
+    @location(0) accum: vec4<f32>,
+    @location(1) surface: vec4<f32>,
+};
 
 @fragment
-fn fs_blit(in: VsOut) -> @location(0) vec4<f32> {
-    return textureSample(src_tex, src_sampler, in.uv);
+fn fs_decay(in: VsOut) -> FeedbackOut {
+    let c = textureSample(src_tex, src_sampler, in.uv) * decay.factor;
+    return FeedbackOut(c, c);
 }

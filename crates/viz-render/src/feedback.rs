@@ -1,16 +1,18 @@
 //! Feedback / trails: a persistent offscreen accumulator.
 //!
-//! When feedback is active each frame does three things:
-//! 1. **Decay** — multiply the previous frame's accumulated image by `decay`.
+//! When feedback is active each frame runs ONE render pass with two color attachments,
+//! the accumulator `curr` and the surface, which receive identical output and blending:
+//! 1. **Decay** — draw the previous frame's accumulated image multiplied by `decay`.
 //! 2. **Draw** — render this frame's layers on top (handled by [`crate::Renderer`]).
-//! 3. **Blit** — copy the accumulator onto the surface.
+//!
+//! The surface therefore ends up equal to `curr` with no copy pass.
 //!
 //! ## Why ping-pong
 //! A pass cannot sample the texture it is rendering to. We keep **two** accumulator
-//! textures and alternate roles each active frame: the decay pass renders into `curr`
-//! while sampling `prev` (writing `prev * decay`), the layers then draw into `curr`, the
-//! blit samples `curr`, and finally the roles swap so next frame's `prev` is this frame's
-//! result. Both textures use the surface format and are both sampleable + renderable.
+//! textures and alternate roles each active frame: the pass renders into `curr` while
+//! sampling `prev` (writing `prev * decay`), the layers then draw into `curr`, and finally
+//! the roles swap so next frame's `prev` is this frame's result. Both textures use the
+//! surface format and are both sampleable + renderable.
 //!
 //! ## Glitch-free resize
 //! [`Feedback::resize`] reallocates both textures and **clears** them in the same call, so
@@ -21,9 +23,9 @@ use std::num::NonZeroU64;
 
 use wgpu::util::StagingBelt;
 
-use crate::{CLEAR_COLOR, CLEAR_COLOR_TRANSPARENT};
+use crate::{PassTargets, CLEAR_COLOR, CLEAR_COLOR_TRANSPARENT};
 
-/// Two-texture ping-pong accumulator + the fullscreen decay/blit pipelines.
+/// Two-texture ping-pong accumulator + the fullscreen decay pipeline.
 ///
 /// Sizing is owned by [`crate::Renderer`]; this struct only holds the GPU resources and
 /// reallocates them on [`Feedback::resize`].
@@ -39,10 +41,9 @@ pub struct Feedback {
 
     sampler: wgpu::Sampler,
     bind_layout: wgpu::BindGroupLayout,
-    /// Pipeline that multiplies the sampled texture by a decay uniform.
+    /// Pipeline that multiplies the sampled texture by a decay uniform, writing both
+    /// attachments of the feedback pass (`curr` and the surface).
     decay_pipeline: wgpu::RenderPipeline,
-    /// Pipeline that copies the sampled texture straight through (blit).
-    blit_pipeline: wgpu::RenderPipeline,
     /// Uniform holding the current `decay` factor (one f32, padded to 16 bytes).
     decay_uniform: wgpu::Buffer,
     /// Bind group for the decay uniform.
@@ -139,13 +140,7 @@ impl Feedback {
             bind_group_layouts: &[Some(&bind_layout), Some(&decay_uniform_layout)],
             immediate_size: 0,
         });
-        let blit_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("feedback-blit-pipeline-layout"),
-            bind_group_layouts: &[Some(&bind_layout)],
-            immediate_size: 0,
-        });
-
-        // Fullscreen passes overwrite the whole target → no blending needed.
+        // The fullscreen decay overwrites the whole target → no blending needed.
         let target = wgpu::ColorTargetState {
             format,
             blend: None,
@@ -171,32 +166,7 @@ impl Feedback {
                 module: &shader,
                 entry_point: Some("fs_decay"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
-                targets: &[Some(target.clone())],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
-
-        let blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("feedback-blit-pipeline"),
-            layout: Some(&blit_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_fullscreen"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: &[],
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_blit"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                targets: &[Some(target)],
+                targets: &PassTargets::FeedbackAndSurface.color_targets(target),
             }),
             multiview_mask: None,
             cache: None,
@@ -213,7 +183,6 @@ impl Feedback {
             sampler,
             bind_layout,
             decay_pipeline,
-            blit_pipeline,
             decay_uniform,
             decay_uniform_bind,
             dirty: true,
@@ -364,8 +333,9 @@ impl Feedback {
     }
 
     /// Records the fullscreen decay draw (`curr = prev * decay`) inside an already-open
-    /// render pass targeting [`Feedback::target_view`], so layers can composite right on
-    /// top in the same render pass without a Store+Load round-trip.
+    /// [`PassTargets::FeedbackAndSurface`] pass whose attachments are
+    /// [`Feedback::target_view`] and the surface, so layers composite right on top in the
+    /// same pass.
     pub fn draw_decay<'p>(&'p self, pass: &mut wgpu::RenderPass<'p>) {
         pass.set_pipeline(&self.decay_pipeline);
         pass.set_bind_group(0, &self.sample_bind[self.prev], &[]);
@@ -393,41 +363,9 @@ impl Feedback {
         self.last_decay = Some(clamped);
     }
 
-    /// Records the blit pass: copy `curr` onto `dst` (the surface). Then advances the
-    /// ping-pong so next frame's `prev` is this frame's accumulator.
-    pub fn blit_to(
-        &mut self,
-        encoder: &mut wgpu::CommandEncoder,
-        dst: &wgpu::TextureView,
-        transparent_bg: bool,
-    ) {
-        let clear_color = if transparent_bg {
-            CLEAR_COLOR_TRANSPARENT
-        } else {
-            CLEAR_COLOR
-        };
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("feedback-blit"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: dst,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(clear_color),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&self.blit_pipeline);
-            pass.set_bind_group(0, &self.sample_bind[self.curr()], &[]);
-            pass.draw(0..3, 0..1);
-        }
-        // Swap: this frame's `curr` becomes next frame's `prev`.
+    /// Advances the ping-pong after the feedback pass so next frame's `prev` is this
+    /// frame's accumulator.
+    pub fn end_frame(&mut self) {
         self.prev = self.curr();
     }
 }

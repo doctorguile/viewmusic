@@ -29,8 +29,7 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
     return out;
 }
 
-@fragment
-fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+fn shade(in: VsOut) -> vec4<f32> {
     let res_f = f32(params.res);
     let col = min(u32(max(in.uv.x, 0.0) * res_f), params.res - 1u);
     let row = min(u32(max(in.uv.y, 0.0) * res_f), params.res - 1u);
@@ -40,4 +39,21 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     }
     let c = cells[params.base + idx];
     return vec4<f32>(c.rgb * c.a, c.a);
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    return shade(in);
+}
+
+// Feedback path: the accumulator (location 0) and the surface (location 1) get the same color.
+struct FeedbackOut {
+    @location(0) accum: vec4<f32>,
+    @location(1) surface: vec4<f32>,
+};
+
+@fragment
+fn fs_main_mrt(in: VsOut) -> FeedbackOut {
+    let c = shade(in);
+    return FeedbackOut(c, c);
 }

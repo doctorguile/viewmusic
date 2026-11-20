@@ -10,6 +10,7 @@
 //! uniform rebind (and the within-frame aliasing that a single shared uniform buffer would
 //! cause when many draws record into one encoder), keeps the hot path to "set pipeline →
 //! set vertex buffer slice → draw", and costs only 6 cheap pipeline objects at startup.
+//! The table exists once per [`PassTargets`] (12 pipelines in all).
 //!
 //! No viewport uniform is needed here: shapes are defined entirely in NDC, so there is no
 //! screen-space conversion (unlike polylines). Instanced draws use no bind groups at all.
@@ -24,7 +25,7 @@ use std::num::NonZeroU64;
 
 use wgpu::util::{DeviceExt, StagingBelt};
 
-use crate::{BlendMode, InstanceData, ShapeKind, MAX_INSTANCES};
+use crate::{BlendMode, InstanceData, PassTargets, ShapeKind, MAX_INSTANCES};
 
 /// Max instanced layers we track per frame (contract §12: 16 layers per scene; even if
 /// every layer were instanced this is the ceiling). Pre-sized to avoid per-frame alloc.
@@ -53,8 +54,8 @@ struct LayerRecord {
 
 /// All instanced pipelines and the shared, pre-allocated buffers.
 pub struct InstancedPipelines {
-    /// `pipelines[shape][blend]`.
-    pipelines: [[wgpu::RenderPipeline; 2]; 3],
+    /// `pipelines[targets][shape][blend]`.
+    pipelines: [[[wgpu::RenderPipeline; 2]; 3]; 2],
     /// Static unit-quad vertex buffer.
     quad: wgpu::Buffer,
     /// Shared instance buffer, capacity `MAX_LAYERS * MAX_INSTANCES`.
@@ -67,7 +68,7 @@ pub struct InstancedPipelines {
 }
 
 impl InstancedPipelines {
-    /// Builds the 6 pipelines and allocates the static quad + shared instance buffer.
+    /// Builds the 12 pipelines and allocates the static quad + shared instance buffer.
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("instanced-shader"),
@@ -93,10 +94,13 @@ impl InstancedPipelines {
             attributes: &wgpu::vertex_attr_array![1 => Float32x4, 2 => Float32, 3 => Float32x4],
         };
 
-        let fs_entries = ["fs_rect", "fs_circle", "fs_triangle"];
+        let fs_entries = [
+            ["fs_rect", "fs_circle", "fs_triangle"],
+            ["fs_rect_mrt", "fs_circle_mrt", "fs_triangle_mrt"],
+        ];
         let blends = [BlendMode::Alpha, BlendMode::Add];
 
-        let make = |fs: &str, blend: BlendMode| -> wgpu::RenderPipeline {
+        let make = |targets: PassTargets, shape: usize, blend: BlendMode| -> wgpu::RenderPipeline {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("instanced-pipeline"),
                 layout: Some(&layout),
@@ -114,21 +118,22 @@ impl InstancedPipelines {
                 multisample: wgpu::MultisampleState::default(),
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
-                    entry_point: Some(fs),
+                    entry_point: Some(fs_entries[targets.index()][shape]),
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
+                    targets: &targets.color_targets(wgpu::ColorTargetState {
                         format,
                         blend: Some(blend.state()),
                         write_mask: wgpu::ColorWrites::ALL,
-                    })],
+                    }),
                 }),
                 multiview_mask: None,
                 cache: None,
             })
         };
 
-        let pipelines =
-            std::array::from_fn(|s| std::array::from_fn(|b| make(fs_entries[s], blends[b])));
+        let pipelines = PassTargets::ALL.map(|targets| {
+            std::array::from_fn(|s| std::array::from_fn(|b| make(targets, s, blends[b])))
+        });
 
         let quad = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("instanced-quad"),
@@ -204,7 +209,7 @@ impl InstancedPipelines {
     }
 
     /// Records the draw for the `idx`-th instanced layer pushed this frame.
-    pub fn draw<'p>(&'p self, pass: &mut wgpu::RenderPass<'p>, idx: usize) {
+    pub fn draw<'p>(&'p self, pass: &mut wgpu::RenderPass<'p>, idx: usize, targets: PassTargets) {
         if idx >= self.len {
             return;
         }
@@ -212,7 +217,7 @@ impl InstancedPipelines {
         if rec.count == 0 {
             return;
         }
-        pass.set_pipeline(&self.pipelines[rec.shape.index()][rec.blend.index()]);
+        pass.set_pipeline(&self.pipelines[targets.index()][rec.shape.index()][rec.blend.index()]);
         pass.set_vertex_buffer(0, self.quad.slice(..));
         let start = rec.base as u64 * std::mem::size_of::<InstanceData>() as u64;
         let end = (rec.base + rec.count) as u64 * std::mem::size_of::<InstanceData>() as u64;

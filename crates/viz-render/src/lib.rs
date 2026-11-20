@@ -24,7 +24,7 @@
 //! - [`instanced`]: instanced quads with rect/circle/triangle masking, two blends.
 //! - [`polyline`]: thick polylines as instanced screen-space segment quads.
 //! - [`field`]: resolution×resolution color grid as instanced cell quads.
-//! - [`feedback`]: persistent decay/trails framebuffer + blit-to-surface.
+//! - [`feedback`]: persistent decay/trails accumulator (rendered alongside the surface).
 //! - [`degrade`]: pure adaptive-detail / pause ladder logic (no GPU).
 
 mod degrade;
@@ -131,6 +131,41 @@ impl BlendMode {
                     operation: wgpu::BlendOperation::Add,
                 },
             },
+        }
+    }
+}
+
+/// The color attachments of the pass a layer pipeline draws into.
+///
+/// The feedback path renders the accumulator and the surface in ONE pass with identical
+/// shader output and blend state on both attachments, so the surface ends up equal to the
+/// accumulator without a separate full-screen blit pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PassTargets {
+    /// Direct path: the surface only.
+    Surface,
+    /// Feedback path: `@location(0)` = accumulator (`curr`), `@location(1)` = surface.
+    FeedbackAndSurface,
+}
+
+impl PassTargets {
+    /// Both variants, in [`PassTargets::index`] order (for building pipeline tables).
+    const ALL: [PassTargets; 2] = [PassTargets::Surface, PassTargets::FeedbackAndSurface];
+
+    /// Index into two-element per-target pipeline tables.
+    #[inline]
+    fn index(self) -> usize {
+        match self {
+            PassTargets::Surface => 0,
+            PassTargets::FeedbackAndSurface => 1,
+        }
+    }
+
+    /// `state` repeated once per attachment, as the pipeline's fragment target list.
+    fn color_targets(self, state: wgpu::ColorTargetState) -> Vec<Option<wgpu::ColorTargetState>> {
+        match self {
+            PassTargets::Surface => vec![Some(state)],
+            PassTargets::FeedbackAndSurface => vec![Some(state.clone()), Some(state)],
         }
     }
 }
@@ -308,8 +343,12 @@ impl Renderer {
     ///
     /// Two paths:
     /// - `feedback_decay = None`: clear the surface dark, draw layers directly onto it.
-    /// - `feedback_decay = Some(d)`: decay the persistent feedback texture by `d`, draw
-    ///   layers INTO it, then blit it onto the surface.
+    /// - `feedback_decay = Some(d)`: decay the persistent feedback texture by `d` and draw
+    ///   layers into it, writing the surface as a second attachment of the same pass.
+    ///
+    /// The feedback pass needs `surface_view` to match the accumulator size, so the
+    /// renderer follows the surface size here (a no-op when [`Renderer::resize`] already
+    /// matched it).
     pub fn render(
         &mut self,
         device: &wgpu::Device,
@@ -319,7 +358,9 @@ impl Renderer {
         params: &SceneParams,
         layers: &[LayerDraw],
     ) {
-        let _ = (device, queue); // sizes are fixed by resize(); uploads go through staging_belt.
+        let _ = queue; // uploads go through staging_belt.
+        let surface_size = surface_view.texture().size();
+        self.resize(device, surface_size.width, surface_size.height);
 
         // Reclaim any staging chunks whose previous submit finished (safe even if the
         // caller did not invoke `recall_staging` after submit).
@@ -361,7 +402,7 @@ impl Renderer {
                     occlusion_query_set: None,
                     multiview_mask: None,
                 });
-                self.draw_layers(&mut pass, layers);
+                self.draw_layers(&mut pass, layers, PassTargets::Surface);
             }
             Some(decay) => {
                 // Queue the decay scalar (cached) before recording the pass that reads it.
@@ -369,32 +410,38 @@ impl Renderer {
                     .set_decay(&mut self.staging_belt, encoder, decay);
                 // Clear accumulators lazily if resized, bypassed, or transparency toggled.
                 self.feedback.prepare_frame(encoder, params.transparent_bg);
-                // Merged pass: draw `prev * decay` fullscreen triangle AND all layers into
-                // `curr` inside one render pass (avoids a full-resolution Store+Load round-trip).
+                // One pass draws `prev * decay` fullscreen AND all layers into both `curr`
+                // and the surface, so no blit pass has to copy `curr` to the surface.
                 {
-                    let view = self.feedback.target_view();
+                    let ops = wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(clear_color),
+                        store: wgpu::StoreOp::Store,
+                    };
                     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("viz-render-into-feedback"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view,
-                            resolve_target: None,
-                            depth_slice: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(clear_color),
-                                store: wgpu::StoreOp::Store,
-                            },
-                        })],
+                        label: Some("viz-render-feedback-and-surface"),
+                        color_attachments: &[
+                            Some(wgpu::RenderPassColorAttachment {
+                                view: self.feedback.target_view(),
+                                resolve_target: None,
+                                depth_slice: None,
+                                ops,
+                            }),
+                            Some(wgpu::RenderPassColorAttachment {
+                                view: surface_view,
+                                resolve_target: None,
+                                depth_slice: None,
+                                ops,
+                            }),
+                        ],
                         depth_stencil_attachment: None,
                         timestamp_writes: None,
                         occlusion_query_set: None,
                         multiview_mask: None,
                     });
                     self.feedback.draw_decay(&mut pass);
-                    self.draw_layers(&mut pass, layers);
+                    self.draw_layers(&mut pass, layers, PassTargets::FeedbackAndSurface);
                 }
-                // Blit feedback → surface (clear the surface first, then copy).
-                self.feedback
-                    .blit_to(encoder, surface_view, params.transparent_bg);
+                self.feedback.end_frame();
             }
         }
 
@@ -450,7 +497,12 @@ impl Renderer {
     }
 
     /// Records draw calls for every layer, in order, into an open render pass.
-    fn draw_layers<'p>(&'p self, pass: &mut wgpu::RenderPass<'p>, layers: &[LayerDraw]) {
+    fn draw_layers<'p>(
+        &'p self,
+        pass: &mut wgpu::RenderPass<'p>,
+        layers: &[LayerDraw],
+        targets: PassTargets,
+    ) {
         // Each sub-module tracks how many of its layers it has emitted this frame so the
         // per-layer GPU buffer offsets line up with the upload() order.
         let mut inst_idx = 0;
@@ -459,15 +511,15 @@ impl Renderer {
         for layer in layers {
             match layer {
                 LayerDraw::Instanced { .. } => {
-                    self.instanced.draw(pass, inst_idx);
+                    self.instanced.draw(pass, inst_idx, targets);
                     inst_idx += 1;
                 }
                 LayerDraw::Polyline { .. } => {
-                    self.polyline.draw(pass, poly_idx);
+                    self.polyline.draw(pass, poly_idx, targets);
                     poly_idx += 1;
                 }
                 LayerDraw::Field { .. } => {
-                    self.field.draw(pass, field_idx);
+                    self.field.draw(pass, field_idx, targets);
                     field_idx += 1;
                 }
             }

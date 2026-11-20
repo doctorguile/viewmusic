@@ -9,7 +9,7 @@ use std::num::NonZeroU64;
 
 use wgpu::util::StagingBelt;
 
-use crate::{BlendMode, MAX_FIELD_CELLS, MAX_FIELD_RES};
+use crate::{BlendMode, PassTargets, MAX_FIELD_CELLS, MAX_FIELD_RES};
 
 /// Max field layers tracked per frame (contract §12: ≤16 layers per scene).
 const MAX_LAYERS: usize = 16;
@@ -32,9 +32,11 @@ struct LayerRecord {
     dynamic_offset: u32,
 }
 
-/// Field pipelines (one per blend) + shared cell storage buffer + dynamic params uniform.
+/// Field pipelines (one per pass targets × blend) + shared cell storage buffer + dynamic
+/// params uniform.
 pub struct FieldPipelines {
-    pipelines: [wgpu::RenderPipeline; 2],
+    /// `pipelines[targets][blend]`.
+    pipelines: [[wgpu::RenderPipeline; 2]; 2],
     /// Shared cell color buffer (`[f32; 4]` × `MAX_LAYERS * MAX_FIELD_CELLS`).
     cells_buf: wgpu::Buffer,
     /// Dynamic-offset uniform buffer holding `MAX_LAYERS` aligned [`FieldParams`] slots.
@@ -51,7 +53,7 @@ pub struct FieldPipelines {
 }
 
 impl FieldPipelines {
-    /// Builds the two pipelines and pre-allocates storage + dynamic uniform buffers.
+    /// Builds the four pipelines and pre-allocates storage + dynamic uniform buffers.
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("field-shader"),
@@ -97,7 +99,7 @@ impl FieldPipelines {
             immediate_size: 0,
         });
 
-        let make = |blend: BlendMode| {
+        let make = |targets: PassTargets, blend: BlendMode| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("field-pipeline"),
                 layout: Some(&layout),
@@ -115,20 +117,25 @@ impl FieldPipelines {
                 multisample: wgpu::MultisampleState::default(),
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
-                    entry_point: Some("fs_main"),
+                    entry_point: Some(["fs_main", "fs_main_mrt"][targets.index()]),
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
+                    targets: &targets.color_targets(wgpu::ColorTargetState {
                         format,
                         blend: Some(blend.state()),
                         write_mask: wgpu::ColorWrites::ALL,
-                    })],
+                    }),
                 }),
                 multiview_mask: None,
                 cache: None,
             })
         };
 
-        let pipelines = [make(BlendMode::Alpha), make(BlendMode::Add)];
+        let pipelines = PassTargets::ALL.map(|targets| {
+            [
+                make(targets, BlendMode::Alpha),
+                make(targets, BlendMode::Add),
+            ]
+        });
 
         let cells_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("field-cells"),
@@ -251,7 +258,7 @@ impl FieldPipelines {
     }
 
     /// Records the draw for the `idx`-th field layer pushed this frame (3 vertices).
-    pub fn draw<'p>(&'p self, pass: &mut wgpu::RenderPass<'p>, idx: usize) {
+    pub fn draw<'p>(&'p self, pass: &mut wgpu::RenderPass<'p>, idx: usize, targets: PassTargets) {
         if idx >= self.len {
             return;
         }
@@ -259,7 +266,7 @@ impl FieldPipelines {
         if rec.count == 0 {
             return;
         }
-        pass.set_pipeline(&self.pipelines[rec.blend as usize]);
+        pass.set_pipeline(&self.pipelines[targets.index()][rec.blend as usize]);
         pass.set_bind_group(0, &self.bind_group, &[rec.dynamic_offset]);
         pass.draw(0..3, 0..1);
     }
