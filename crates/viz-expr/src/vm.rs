@@ -464,6 +464,9 @@ impl Vm {
     }
 
     /// Loads precomputed column values for `col` into `self.temps` before `eval_multi_item`.
+    ///
+    /// Scalar reference path: the runtime passes column values to
+    /// [`Vm::eval_multi_batch`] instead; tests use this to check the batch path.
     #[inline]
     pub fn load_multi_col(&mut self, mp: &MultiProgram, col_src: &[f64]) {
         if mp.num_col > 0 {
@@ -473,6 +476,9 @@ impl Vm {
     }
 
     /// Evaluates per-item bytecode for `mp`, writing all varying outputs into `outs`.
+    ///
+    /// Scalar reference path: the runtime evaluates items with [`Vm::eval_multi_batch`],
+    /// and tests check that it matches this one item at a time, bit for bit.
     #[inline]
     pub fn eval_multi_item(&mut self, mp: &MultiProgram, outs: &mut [f64; MAX_MULTI_OUTS]) {
         if mp.item_ops.is_empty() {

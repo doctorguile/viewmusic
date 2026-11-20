@@ -86,7 +86,7 @@ pub use lexer::{lex, LexError, Token, TokenKind};
 // test's reference evaluator reproduces the VM's semantics bit-for-bit.
 pub use vm::{
     apply_binary, apply_unary, builtin_arity, sanitize, BinaryKind, Lanes, MultiProgram, Op,
-    Program, UnaryKind, Vm, BATCH_LANES, BATCH_SLOTS, MAX_MULTI_OUTS, MAX_TEMPS, STACK_SIZE,
+    Program, UnaryKind, Vm, BATCH_LANES, MAX_MULTI_OUTS, MAX_TEMPS, STACK_SIZE,
 };
 
 #[cfg(test)]

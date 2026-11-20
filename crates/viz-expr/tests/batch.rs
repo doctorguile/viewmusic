@@ -123,8 +123,9 @@ fn arb_value() -> impl Strategy<Value = f64> {
     ]
 }
 
-/// Evaluates `mp` for `lanes` items per item and as one batch; returns
-/// `(scalar, batch)` outputs as `[item][out]` bit patterns.
+/// Evaluates `mp` for `lane_a.len()` items per item (on a fresh VM) and in
+/// consecutive batches (on another fresh VM); returns `(scalar, batch)` outputs as
+/// `[item][out]` bit patterns.
 #[allow(clippy::type_complexity)]
 fn run_both(
     mp: &MultiProgram,
@@ -134,14 +135,36 @@ fn run_both(
     lane_b: &[f64],
     seed: u64,
 ) -> (Vec<[u64; MAX_MULTI_OUTS]>, Vec<[u64; MAX_MULTI_OUTS]>) {
-    let scope = make_scope();
-    let frame = make_frame();
-    let lanes = lane_a.len();
-    let (slot_a, slot_b) = if field { (X, I) } else { (I, U) };
-    let num_col = mp.num_col();
+    let scalar = run_scalar(mp, field, shared_vals, lane_a, lane_b, seed);
+    let mut vm = new_vm(seed);
+    let batch = run_batches(&mut vm, mp, field, shared_vals, lane_a, lane_b);
+    (scalar, batch)
+}
 
-    let mut vm = Vm::new(scope.slot_count(), seed);
-    vm.set_frame(&frame);
+fn new_vm(seed: u64) -> Vm {
+    let mut vm = Vm::new(make_scope().slot_count(), seed);
+    vm.set_frame(&make_frame());
+    vm
+}
+
+/// The per-item lane slots of the element shape (`i`, `u`) or field shape (`x`, `i`).
+fn lane_slots(field: bool) -> (SlotId, SlotId) {
+    if field {
+        (X, I)
+    } else {
+        (I, U)
+    }
+}
+
+/// Sets every slot to `shared_vals`, runs the hoisted (and, for a field, row) ops, and
+/// fills the per-item column table. Returns the hoisted/row outputs and the table.
+fn prepare(
+    vm: &mut Vm,
+    mp: &MultiProgram,
+    field: bool,
+    shared_vals: &[f64],
+    lane_a: &[f64],
+) -> ([f64; MAX_MULTI_OUTS], Vec<f64>) {
     for (k, v) in shared_vals.iter().enumerate() {
         vm.set_slot(SlotId(k as u16), *v);
     }
@@ -150,49 +173,83 @@ fn run_both(
     if field {
         vm.eval_multi_row(mp, &mut seed_outs);
     }
-    let mut col_src = vec![0.0f64; lanes * num_col];
+    let num_col = mp.num_col();
+    let mut col_src = vec![0.0f64; lane_a.len() * num_col];
     if field && num_col > 0 {
-        for k in 0..lanes {
-            vm.set_slot(X, lane_a[k]);
+        for (k, &x) in lane_a.iter().enumerate() {
+            vm.set_slot(X, x);
             vm.eval_multi_col(mp, &mut col_src[k * num_col..(k + 1) * num_col]);
         }
     }
+    (seed_outs, col_src)
+}
 
-    let mut scalar = Vec::with_capacity(lanes);
+/// The scalar reference: each item through `Vm::eval_multi_item` on a fresh VM.
+fn run_scalar(
+    mp: &MultiProgram,
+    field: bool,
+    shared_vals: &[f64],
+    lane_a: &[f64],
+    lane_b: &[f64],
+    seed: u64,
+) -> Vec<[u64; MAX_MULTI_OUTS]> {
+    let mut vm = new_vm(seed);
+    let (seed_outs, col_src) = prepare(&mut vm, mp, field, shared_vals, lane_a);
+    let (slot_a, slot_b) = lane_slots(field);
+    let num_col = mp.num_col();
     let mut outs = seed_outs;
-    for k in 0..lanes {
-        vm.set_slot(slot_a, lane_a[k]);
-        vm.set_slot(slot_b, lane_b[k]);
-        vm.load_multi_col(mp, &col_src[k * num_col..]);
-        vm.eval_multi_item(mp, &mut outs);
-        let mut bits = [0u64; MAX_MULTI_OUTS];
-        for o in 0..mp.num_outputs() {
-            bits[o] = outs[o].to_bits();
-        }
-        scalar.push(bits);
-    }
-
-    let [la, lb] = vm.batch_slot_lanes_mut();
-    la[..lanes].copy_from_slice(lane_a);
-    lb[..lanes].copy_from_slice(lane_b);
-    vm.eval_multi_batch(
-        mp,
-        lanes,
-        [Some(slot_a), Some(slot_b)],
-        &col_src,
-        &seed_outs,
-    );
-    let bo = vm.batch_outs();
-    let batch = (0..lanes)
+    (0..lane_a.len())
         .map(|k| {
+            vm.set_slot(slot_a, lane_a[k]);
+            vm.set_slot(slot_b, lane_b[k]);
+            vm.load_multi_col(mp, &col_src[k * num_col..]);
+            vm.eval_multi_item(mp, &mut outs);
+            let mut bits = [0u64; MAX_MULTI_OUTS];
+            for o in 0..mp.num_outputs() {
+                bits[o] = outs[o].to_bits();
+            }
+            bits
+        })
+        .collect()
+}
+
+/// Evaluates the items on `vm` in consecutive `Vm::eval_multi_batch` calls of up to
+/// `BATCH_LANES` items, the way the runtime does.
+fn run_batches(
+    vm: &mut Vm,
+    mp: &MultiProgram,
+    field: bool,
+    shared_vals: &[f64],
+    lane_a: &[f64],
+    lane_b: &[f64],
+) -> Vec<[u64; MAX_MULTI_OUTS]> {
+    let (seed_outs, col_src) = prepare(vm, mp, field, shared_vals, lane_a);
+    let (slot_a, slot_b) = lane_slots(field);
+    let num_col = mp.num_col();
+    let n = lane_a.len();
+    let mut batch = Vec::with_capacity(n);
+    for start in (0..n).step_by(BATCH_LANES) {
+        let lanes = (n - start).min(BATCH_LANES);
+        let [la, lb] = vm.batch_slot_lanes_mut();
+        la[..lanes].copy_from_slice(&lane_a[start..start + lanes]);
+        lb[..lanes].copy_from_slice(&lane_b[start..start + lanes]);
+        vm.eval_multi_batch(
+            mp,
+            lanes,
+            [Some(slot_a), Some(slot_b)],
+            &col_src[start * num_col..(start + lanes) * num_col],
+            &seed_outs,
+        );
+        let bo = vm.batch_outs();
+        batch.extend((0..lanes).map(|k| {
             let mut bits = [0u64; MAX_MULTI_OUTS];
             for o in 0..mp.num_outputs() {
                 bits[o] = bo[o][k].to_bits();
             }
             bits
-        })
-        .collect();
-    (scalar, batch)
+        }));
+    }
+    batch
 }
 
 proptest! {
@@ -257,5 +314,66 @@ fn batch_matches_per_item_on_index_formulas() {
             let (scalar, batch) = run_both(&mp, field, &shared_vals, &lane_a, &lane_b, 42);
             assert_eq!(scalar, batch, "field={field} lanes={lanes}");
         }
+    }
+}
+
+/// More than `BATCH_LANES` items (consecutive batches, last one partial) and different
+/// programs evaluated back to back on ONE VM still match the scalar path bit for bit, so
+/// no lane state leaks between batches or programs.
+#[test]
+fn consecutive_batches_and_programs_on_one_vm_match_per_item() {
+    let scope = make_scope();
+    let compile = |srcs: &[&str], field: bool| {
+        let inputs: Vec<MultiInput> = srcs.iter().map(|s| MultiInput::Expr(s)).collect();
+        if field {
+            compile_multi(&inputs, &scope, &[I], Some(Y), Some(X)).unwrap()
+        } else {
+            compile_multi(&inputs, &scope, &[I, U], None, None).unwrap()
+        }
+    };
+    let elem = compile(
+        &[
+            "sin(i * 0.1 + t) * u",
+            "u * u + rand(i)",
+            "if(i % 3 == 0, band(u), wave(fract(u * 5)))",
+            "abs(cos(u * 7 - t)) + i % 5 + sin(i * 0.1 + t)",
+            "max(u, energy) * low",
+        ],
+        false,
+    );
+    let field = compile(
+        &[
+            "sin(x * 3 + t) * cos(y * 3 - t) + (i % 7) / 7",
+            "abs(sin(x * y * 3 + t)) * smoothstep(0.1, 0.9, x)",
+            "fract(i * 0.37) + x * settings.k",
+        ],
+        true,
+    );
+    let shared_vals = [1.25, 0.5, 0.3, 2.0, 0.0, 0.0, 4096.0, 0.0, 0.3];
+
+    // Elements: 3 full batches plus a partial one.
+    let n = 3 * BATCH_LANES + 13;
+    let elem_a: Vec<f64> = (0..n).map(|k| k as f64).collect();
+    let elem_b: Vec<f64> = (0..n).map(|k| k as f64 / (n - 1) as f64).collect();
+    // One field row of `res` cells: a full batch plus a partial one.
+    let res = 2 * BATCH_LANES - 28;
+    let field_a: Vec<f64> = (0..res)
+        .map(|k| -1.0 + (k as f64 + 0.5) * (2.0 / res as f64))
+        .collect();
+    let field_b: Vec<f64> = (0..res).map(|k| (3 * res + k) as f64).collect();
+
+    let seed = 42;
+    let mut vm = new_vm(seed);
+    let cases = [
+        ("elem", &elem, false, &elem_a, &elem_b),
+        ("field", &field, true, &field_a, &field_b),
+        ("elem again", &elem, false, &elem_a, &elem_b),
+        ("field again", &field, true, &field_a, &field_b),
+    ];
+    for (name, mp, is_field, lane_a, lane_b) in cases {
+        let scalar = run_scalar(mp, is_field, &shared_vals, lane_a, lane_b, seed);
+        let batch = run_batches(&mut vm, mp, is_field, &shared_vals, lane_a, lane_b);
+        assert_eq!(scalar.len(), lane_a.len());
+        assert_eq!(scalar, batch, "{name}");
     }
 }
