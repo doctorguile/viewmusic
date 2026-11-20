@@ -25,7 +25,7 @@ use std::num::NonZeroU64;
 
 use wgpu::util::DeviceExt;
 
-use crate::upload::{Uploader, VERTEX_ALIGN};
+use crate::upload::{CopyTarget, Uploader, VERTEX_ALIGN};
 use crate::{BlendMode, InstanceData, PassTargets, ShapeKind, MAX_INSTANCES};
 
 /// Max instanced layers we track per frame (contract §12: 16 layers per scene; even if
@@ -60,11 +60,9 @@ pub struct InstancedPipelines {
     quad: wgpu::Buffer,
     /// Copy destination for instances (capacity `MAX_LAYERS * MAX_INSTANCES`); `None` when
     /// the draws bind the upload chunks directly.
-    copy_target: Option<wgpu::Buffer>,
+    copy_target: Option<CopyTarget>,
     /// Per-frame layer records (capacity `MAX_LAYERS`, reserved up front).
     records: Vec<LayerRecord>,
-    /// Running write cursor (in instances) into `copy_target` for the current frame.
-    cursor: u32,
 }
 
 impl InstancedPipelines {
@@ -150,13 +148,13 @@ impl InstancedPipelines {
         });
 
         let copy_target = (!direct).then(|| {
-            device.create_buffer(&wgpu::BufferDescriptor {
+            CopyTarget::new(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("instanced-data"),
                 size: (std::mem::size_of::<InstanceData>() * MAX_LAYERS * MAX_INSTANCES)
                     as wgpu::BufferAddress,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
-            })
+            }))
         });
 
         Self {
@@ -164,14 +162,15 @@ impl InstancedPipelines {
             quad,
             copy_target,
             records: Vec::with_capacity(MAX_LAYERS),
-            cursor: 0,
         }
     }
 
     /// Resets per-frame bookkeeping. Call once before pushing this frame's layers.
     pub fn begin_frame(&mut self) {
         self.records.clear();
-        self.cursor = 0;
+        if let Some(target) = &mut self.copy_target {
+            target.rewind();
+        }
     }
 
     /// Uploads one instanced layer's data and records how to draw it.
@@ -192,14 +191,8 @@ impl InstancedPipelines {
         let take = instances.len().min(MAX_INSTANCES);
         let bytes: &[u8] = bytemuck::cast_slice(&instances[..take]);
         let data = NonZeroU64::new(bytes.len() as u64).map(|size| {
-            let copy_offset = self.cursor as u64 * std::mem::size_of::<InstanceData>() as u64;
-            let (mut view, buffer, offset) = upload.write(
-                encoder,
-                self.copy_target.as_ref(),
-                copy_offset,
-                size,
-                VERTEX_ALIGN,
-            );
+            let (mut view, buffer, offset) =
+                upload.write(encoder, self.copy_target.as_mut(), size, VERTEX_ALIGN);
             view.copy_from_slice(bytes);
             (buffer, offset)
         });
@@ -209,7 +202,6 @@ impl InstancedPipelines {
             data,
             count: take as u32,
         });
-        self.cursor += take as u32;
     }
 
     /// Records the draw for the `idx`-th instanced layer pushed this frame.

@@ -23,7 +23,7 @@
 
 use std::num::NonZeroU64;
 
-use crate::upload::{cached_bind_group, Uploader};
+use crate::upload::{cached_bind_group, CopyTarget, Uploader};
 use crate::{PassTargets, CLEAR_COLOR, CLEAR_COLOR_TRANSPARENT};
 
 /// Size of the decay uniform: one f32, padded to 16 bytes (uniform alignment).
@@ -63,7 +63,7 @@ pub struct Feedback {
     decay_uniform_layout: wgpu::BindGroupLayout,
     /// Copy destination for the decay uniform; `None` when the draw binds the upload
     /// chunk directly.
-    decay_copy_target: Option<wgpu::Buffer>,
+    decay_copy_target: Option<CopyTarget>,
     /// Decay uniform bind group per buffer that has held the decay value.
     decay_bind_groups: Vec<(wgpu::Buffer, wgpu::BindGroup)>,
     /// This frame's decay bind group (index into `decay_bind_groups`) and its offset.
@@ -79,7 +79,8 @@ pub struct Feedback {
     /// Tracks the previous `transparent_bg` mode so toggling transparency marks the
     /// accumulators dirty and clears them cleanly to the new background color.
     last_transparent: bool,
-    /// Decay value in `decay_copy_target`, so an unchanged decay skips the copy.
+    /// Decay value in `decay_copy_target`, so an unchanged decay skips the copy (copy
+    /// path only).
     last_decay: Option<f32>,
     /// Consecutive frames rendered without feedback.
     inactive_frames: u32,
@@ -148,12 +149,12 @@ impl Feedback {
             });
 
         let decay_copy_target = (!direct).then(|| {
-            device.create_buffer(&wgpu::BufferDescriptor {
+            CopyTarget::new(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("feedback-decay-uniform"),
                 size: DECAY_BYTES.get(),
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
-            })
+            }))
         });
         let uniform_align =
             NonZeroU64::new(device.limits().min_uniform_buffer_offset_alignment.into())
@@ -379,14 +380,17 @@ impl Feedback {
         decay: f32,
     ) {
         let clamped = decay.clamp(0.0, 0.99);
-        if self.decay_copy_target.is_some() && self.last_decay == Some(clamped) {
-            return;
+        if let Some(target) = &mut self.decay_copy_target {
+            if self.last_decay == Some(clamped) {
+                return;
+            }
+            self.last_decay = Some(clamped);
+            target.rewind();
         }
         let v = [clamped, 0.0, 0.0, 0.0];
         let (mut view, buffer, offset) = upload.write(
             encoder,
-            self.decay_copy_target.as_ref(),
-            0,
+            self.decay_copy_target.as_mut(),
             DECAY_BYTES,
             self.uniform_align,
         );
@@ -408,7 +412,6 @@ impl Feedback {
             })
         });
         self.decay_bind = (bind_group, offset as u32);
-        self.last_decay = Some(clamped);
     }
 
     /// Advances the ping-pong after the feedback pass so next frame's `prev` is this

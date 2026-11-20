@@ -45,25 +45,29 @@ impl Uploader {
     }
 
     /// Reserves `size` bytes for this frame and returns the view to fill plus the buffer
-    /// and byte offset the draw must bind.
+    /// and `align`-aligned byte offset the draw must bind.
     ///
     /// `copy_target` is `None` exactly when [`Uploader::direct`]: the bytes then live in a
-    /// belt chunk at an `align`-aligned offset. Otherwise the belt copies them into
-    /// `copy_target` at `copy_offset`.
+    /// belt chunk. Otherwise the belt copies them into `copy_target` at its cursor, which
+    /// then advances by `size` rounded up to `align`.
     pub fn write(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
-        copy_target: Option<&wgpu::Buffer>,
-        copy_offset: wgpu::BufferAddress,
+        copy_target: Option<&mut CopyTarget>,
         size: NonZeroU64,
         align: NonZeroU64,
     ) -> (wgpu::BufferViewMut, wgpu::Buffer, wgpu::BufferAddress) {
         match copy_target {
-            Some(target) => (
-                self.belt.write_buffer(encoder, target, copy_offset, size),
-                target.clone(),
-                copy_offset,
-            ),
+            Some(target) => {
+                let offset = target.cursor;
+                target.cursor += size.get().next_multiple_of(align.get());
+                (
+                    self.belt
+                        .write_buffer(encoder, &target.buffer, offset, size),
+                    target.buffer.clone(),
+                    offset,
+                )
+            }
             None => {
                 let slice = self.belt.allocate(size, align);
                 let buffer = slice.buffer().clone();
@@ -81,6 +85,25 @@ impl Uploader {
     /// Re-maps chunks from submitted frames for reuse; call after submit.
     pub fn recall(&mut self) {
         self.belt.recall();
+    }
+}
+
+/// A persistent buffer that uploads are copied into when they are not bound directly,
+/// with this frame's running write offset.
+pub struct CopyTarget {
+    buffer: wgpu::Buffer,
+    /// Byte offset of the next [`Uploader::write`] into `buffer`.
+    cursor: wgpu::BufferAddress,
+}
+
+impl CopyTarget {
+    pub fn new(buffer: wgpu::Buffer) -> Self {
+        Self { buffer, cursor: 0 }
+    }
+
+    /// Makes the next write start at the beginning of the buffer again.
+    pub fn rewind(&mut self) {
+        self.cursor = 0;
     }
 }
 

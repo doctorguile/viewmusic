@@ -15,7 +15,7 @@
 
 use std::num::NonZeroU64;
 
-use crate::upload::{cached_bind_group, Uploader};
+use crate::upload::{cached_bind_group, CopyTarget, Uploader};
 use crate::{BlendMode, PassTargets, MAX_FIELD_CELLS, MAX_FIELD_RES};
 
 /// Max field layers tracked per frame (contract §12: ≤16 layers per scene).
@@ -50,7 +50,7 @@ pub struct FieldPipelines {
     bind_layout: wgpu::BindGroupLayout,
     /// Copy destination holding `MAX_LAYERS` maximal regions; `None` when the draws bind
     /// the upload chunks directly.
-    copy_target: Option<wgpu::Buffer>,
+    copy_target: Option<CopyTarget>,
     /// Bind group per buffer that has held a region (the copy target, or upload chunks).
     bind_groups: Vec<(wgpu::Buffer, wgpu::BindGroup)>,
     /// Bytes reserved for [`FieldParams`] at the start of each region (uniform offset
@@ -58,8 +58,6 @@ pub struct FieldPipelines {
     param_stride: usize,
     /// Per-frame layer records (capacity `MAX_LAYERS`, reserved up front).
     records: Vec<LayerRecord>,
-    /// Running byte cursor into `copy_target` for the current frame.
-    cursor: u64,
 }
 
 impl FieldPipelines {
@@ -149,7 +147,7 @@ impl FieldPipelines {
         let unblended = PassTargets::ALL.map(|targets| make(targets, None));
 
         let copy_target = (!direct).then(|| {
-            device.create_buffer(&wgpu::BufferDescriptor {
+            CopyTarget::new(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("field-regions"),
                 size: ((param_stride + std::mem::size_of::<[f32; 4]>() * MAX_FIELD_CELLS)
                     * MAX_LAYERS) as wgpu::BufferAddress,
@@ -157,7 +155,7 @@ impl FieldPipelines {
                     | wgpu::BufferUsages::UNIFORM
                     | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
-            })
+            }))
         });
 
         Self {
@@ -168,14 +166,15 @@ impl FieldPipelines {
             bind_groups: Vec::new(),
             param_stride,
             records: Vec::with_capacity(MAX_LAYERS),
-            cursor: 0,
         }
     }
 
     /// Resets per-frame bookkeeping.
     pub fn begin_frame(&mut self) {
         self.records.clear();
-        self.cursor = 0;
+        if let Some(target) = &mut self.copy_target {
+            target.rewind();
+        }
     }
 
     /// Uploads the raw cell colors for one field layer directly (zero CPU packing loop).
@@ -218,8 +217,7 @@ impl FieldPipelines {
         let region = stride + (total * std::mem::size_of::<[f32; 4]>()) as u64;
         let (mut view, buffer, offset) = upload.write(
             encoder,
-            self.copy_target.as_ref(),
-            self.cursor,
+            self.copy_target.as_mut(),
             NonZeroU64::new(region).expect("region holds params"),
             NonZeroU64::new(stride).expect("non-zero param stride"),
         );
@@ -266,7 +264,6 @@ impl FieldPipelines {
             bind_group,
             dynamic_offset: offset as u32,
         });
-        self.cursor += region.next_multiple_of(stride);
         opaque
     }
 

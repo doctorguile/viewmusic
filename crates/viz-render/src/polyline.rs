@@ -14,7 +14,7 @@ use std::num::NonZeroU64;
 
 use wgpu::util::DeviceExt;
 
-use crate::upload::{Uploader, VERTEX_ALIGN};
+use crate::upload::{CopyTarget, Uploader, VERTEX_ALIGN};
 use crate::{BlendMode, PassTargets, PointData, MAX_POINTS};
 
 /// Max polyline layers tracked per frame (contract §12: ≤16 layers per scene).
@@ -55,13 +55,11 @@ pub struct PolylinePipelines {
     template: wgpu::Buffer,
     /// Copy destination for segments (capacity `MAX_LAYERS * MAX_POINTS`); `None` when the
     /// draws bind the upload chunks directly.
-    copy_target: Option<wgpu::Buffer>,
+    copy_target: Option<CopyTarget>,
     /// CPU staging for the current layer's segments (pre-allocated, no per-frame alloc).
     staging: Vec<Segment>,
     /// Per-frame layer records (capacity `MAX_LAYERS`, reserved up front).
     records: Vec<LayerRecord>,
-    /// Running write cursor (in segments) into `copy_target` for the current frame.
-    cursor: u32,
 }
 
 /// Template quad: x along segment in [0,1], y perpendicular in [-0.5, 0.5].
@@ -157,13 +155,13 @@ impl PolylinePipelines {
                 },
         });
         let copy_target = (!direct).then(|| {
-            device.create_buffer(&wgpu::BufferDescriptor {
+            CopyTarget::new(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("polyline-segments"),
                 size: (std::mem::size_of::<Segment>() * MAX_LAYERS * MAX_POINTS)
                     as wgpu::BufferAddress,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
-            })
+            }))
         });
 
         Self {
@@ -172,14 +170,15 @@ impl PolylinePipelines {
             copy_target,
             staging: Vec::with_capacity(MAX_POINTS),
             records: Vec::with_capacity(MAX_LAYERS),
-            cursor: 0,
         }
     }
 
     /// Resets per-frame bookkeeping.
     pub fn begin_frame(&mut self) {
         self.records.clear();
-        self.cursor = 0;
+        if let Some(target) = &mut self.copy_target {
+            target.rewind();
+        }
     }
 
     /// Builds and uploads the segments for one polyline layer.
@@ -242,14 +241,8 @@ impl PolylinePipelines {
         let take = self.staging.len();
         let bytes: &[u8] = bytemuck::cast_slice(&self.staging);
         let data = NonZeroU64::new(bytes.len() as u64).map(|size| {
-            let copy_offset = self.cursor as u64 * std::mem::size_of::<Segment>() as u64;
-            let (mut view, buffer, offset) = upload.write(
-                encoder,
-                self.copy_target.as_ref(),
-                copy_offset,
-                size,
-                VERTEX_ALIGN,
-            );
+            let (mut view, buffer, offset) =
+                upload.write(encoder, self.copy_target.as_mut(), size, VERTEX_ALIGN);
             view.copy_from_slice(bytes);
             (buffer, offset)
         });
@@ -258,7 +251,6 @@ impl PolylinePipelines {
             data,
             count: take as u32,
         });
-        self.cursor += take as u32;
     }
 
     /// Records the draw for the `idx`-th polyline layer pushed this frame.
