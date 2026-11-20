@@ -7,6 +7,12 @@
 //!  (b) drawn pixels differ from the clear color where geometry is,
 //!  (c) additive blend brightens overlapping instances.
 //!
+//! Every test runs twice (see [`on_both_upload_paths`]): `copy_path::*` on a device with
+//! no optional features, where the staging belt copies into persistent buffers, and
+//! `direct_path::*` on a device with [`viz_render::device_features`], where the draws bind
+//! the belt's mapped chunks. `direct_path::*` passes without rendering when the adapter
+//! does not offer those features.
+//!
 //! Run directly: `cargo test -p viz-render`.
 
 use std::sync::Arc;
@@ -37,12 +43,22 @@ impl Readback {
     }
 }
 
-/// Brings up a headless wgpu device (no surface) with a panicking error hook.
+/// Which upload path the test device makes the renderer take.
+#[derive(Clone, Copy, Debug)]
+enum UploadPath {
+    /// No optional features: uploads are copied into persistent buffers.
+    Copy,
+    /// [`viz_render::device_features`]: draws bind the mapped upload chunks directly.
+    Direct,
+}
+
+/// Brings up a headless wgpu device (no surface) for `path` with a panicking error hook.
+/// Returns `None` for [`UploadPath::Direct`] when the adapter lacks its features.
 ///
 /// On macOS the real Metal adapter is always present. On a GPU-less CI runner
 /// (Windows) set `VIEWMUSIC_FORCE_FALLBACK_ADAPTER=1` to request the software
 /// fallback adapter (WARP under DX12), which `Backends::PRIMARY` already reaches.
-fn make_device() -> (wgpu::Device, wgpu::Queue) {
+fn make_device(path: UploadPath) -> Option<(wgpu::Device, wgpu::Queue)> {
     let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
     desc.backends = wgpu::Backends::METAL | wgpu::Backends::PRIMARY;
     let instance = wgpu::Instance::new(desc);
@@ -55,9 +71,20 @@ fn make_device() -> (wgpu::Device, wgpu::Queue) {
     }))
     .expect("no GPU adapter for headless test");
 
+    let required_features = match path {
+        UploadPath::Copy => wgpu::Features::empty(),
+        UploadPath::Direct => {
+            let features = viz_render::device_features(&adapter);
+            if features.is_empty() {
+                eprintln!("skipping direct upload path: adapter lacks the device features");
+                return None;
+            }
+            features
+        }
+    };
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("gpu-smoke-device"),
-        required_features: wgpu::Features::empty(),
+        required_features,
         required_limits: wgpu::Limits::downlevel_defaults(),
         ..Default::default()
     }))
@@ -68,8 +95,51 @@ fn make_device() -> (wgpu::Device, wgpu::Queue) {
         panic!("wgpu validation error: {e}");
     }));
 
-    (device, queue)
+    Some((device, queue))
 }
+
+/// Runs `test` on a fresh device for `path`, or returns when `path` is unavailable.
+fn run_on(path: UploadPath, test: fn(&wgpu::Device, &wgpu::Queue)) {
+    if let Some((device, queue)) = make_device(path) {
+        test(&device, &queue);
+    }
+}
+
+/// Declares one `#[test]` per listed scenario under each of `copy_path` and `direct_path`.
+macro_rules! on_both_upload_paths {
+    ($($scenario:ident),* $(,)?) => {
+        mod copy_path {
+            $(
+                #[test]
+                fn $scenario() {
+                    super::run_on(super::UploadPath::Copy, super::$scenario);
+                }
+            )*
+        }
+        mod direct_path {
+            $(
+                #[test]
+                fn $scenario() {
+                    super::run_on(super::UploadPath::Direct, super::$scenario);
+                }
+            )*
+        }
+    };
+}
+
+on_both_upload_paths!(
+    instanced_rect_draws_and_clears_elsewhere,
+    instanced_circle_masks_corners,
+    instanced_triangle_masks_top_corners,
+    additive_blend_brightens_overlap,
+    polyline_draws_a_visible_line,
+    field_fills_cells_with_color,
+    feedback_path_runs_and_draws,
+    resize_is_glitch_free_clear,
+    transparent_bg_clears_alpha_to_zero_on_direct_and_feedback_paths,
+    leading_opaque_field_matches_blended_draw_under_feedback,
+    partial_field_matches_zero_padded_field_under_add,
+);
 
 /// Creates an offscreen RGBA8 render target (sampleable not needed; COPY_SRC for readback).
 fn make_target(device: &wgpu::Device) -> (wgpu::Texture, wgpu::TextureView) {
@@ -182,11 +252,9 @@ fn is_clearish(p: [u8; 4]) -> bool {
     p[0] < 24 && p[1] < 24 && p[2] < 24
 }
 
-#[test]
-fn instanced_rect_draws_and_clears_elsewhere() {
-    let (device, queue) = make_device();
-    let mut renderer = Renderer::new(&device, &queue, FORMAT);
-    renderer.resize(&device, W, H);
+fn instanced_rect_draws_and_clears_elsewhere(device: &wgpu::Device, queue: &wgpu::Queue) {
+    let mut renderer = Renderer::new(device, queue, FORMAT);
+    renderer.resize(device, W, H);
 
     // One opaque red rect centered, covering the middle.
     let inst = [InstanceData {
@@ -203,8 +271,8 @@ fn instanced_rect_draws_and_clears_elsewhere() {
         instances: &inst,
     }];
     let rb = render_scene(
-        &device,
-        &queue,
+        device,
+        queue,
         &mut renderer,
         &SceneParams::default(),
         &layers,
@@ -221,11 +289,9 @@ fn instanced_rect_draws_and_clears_elsewhere() {
     );
 }
 
-#[test]
-fn instanced_circle_masks_corners() {
-    let (device, queue) = make_device();
-    let mut renderer = Renderer::new(&device, &queue, FORMAT);
-    renderer.resize(&device, W, H);
+fn instanced_circle_masks_corners(device: &wgpu::Device, queue: &wgpu::Queue) {
+    let mut renderer = Renderer::new(device, queue, FORMAT);
+    renderer.resize(device, W, H);
 
     let inst = [InstanceData {
         x: 0.0,
@@ -241,8 +307,8 @@ fn instanced_circle_masks_corners() {
         instances: &inst,
     }];
     let rb = render_scene(
-        &device,
-        &queue,
+        device,
+        queue,
         &mut renderer,
         &SceneParams::default(),
         &layers,
@@ -262,11 +328,9 @@ fn instanced_circle_masks_corners() {
     );
 }
 
-#[test]
-fn instanced_triangle_masks_top_corners() {
-    let (device, queue) = make_device();
-    let mut renderer = Renderer::new(&device, &queue, FORMAT);
-    renderer.resize(&device, W, H);
+fn instanced_triangle_masks_top_corners(device: &wgpu::Device, queue: &wgpu::Queue) {
+    let mut renderer = Renderer::new(device, queue, FORMAT);
+    renderer.resize(device, W, H);
 
     let inst = [InstanceData {
         x: 0.0,
@@ -282,8 +346,8 @@ fn instanced_triangle_masks_top_corners() {
         instances: &inst,
     }];
     let rb = render_scene(
-        &device,
-        &queue,
+        device,
+        queue,
         &mut renderer,
         &SceneParams::default(),
         &layers,
@@ -302,11 +366,9 @@ fn instanced_triangle_masks_top_corners() {
     );
 }
 
-#[test]
-fn additive_blend_brightens_overlap() {
-    let (device, queue) = make_device();
-    let mut renderer = Renderer::new(&device, &queue, FORMAT);
-    renderer.resize(&device, W, H);
+fn additive_blend_brightens_overlap(device: &wgpu::Device, queue: &wgpu::Queue) {
+    let mut renderer = Renderer::new(device, queue, FORMAT);
+    renderer.resize(device, W, H);
 
     // Two half-bright red rects fully overlapping with additive blend → should sum brighter
     // than a single one.
@@ -339,8 +401,8 @@ fn additive_blend_brightens_overlap() {
     ];
 
     let rb_one = render_scene(
-        &device,
-        &queue,
+        device,
+        queue,
         &mut renderer,
         &SceneParams::default(),
         &[LayerDraw::Instanced {
@@ -350,8 +412,8 @@ fn additive_blend_brightens_overlap() {
         }],
     );
     let rb_two = render_scene(
-        &device,
-        &queue,
+        device,
+        queue,
         &mut renderer,
         &SceneParams::default(),
         &[LayerDraw::Instanced {
@@ -369,11 +431,9 @@ fn additive_blend_brightens_overlap() {
     );
 }
 
-#[test]
-fn polyline_draws_a_visible_line() {
-    let (device, queue) = make_device();
-    let mut renderer = Renderer::new(&device, &queue, FORMAT);
-    renderer.resize(&device, W, H);
+fn polyline_draws_a_visible_line(device: &wgpu::Device, queue: &wgpu::Queue) {
+    let mut renderer = Renderer::new(device, queue, FORMAT);
+    renderer.resize(device, W, H);
 
     // Horizontal thick line across the middle.
     let pts = [
@@ -395,8 +455,8 @@ fn polyline_draws_a_visible_line() {
         points: &pts,
     }];
     let rb = render_scene(
-        &device,
-        &queue,
+        device,
+        queue,
         &mut renderer,
         &SceneParams::default(),
         &layers,
@@ -415,11 +475,9 @@ fn polyline_draws_a_visible_line() {
     );
 }
 
-#[test]
-fn field_fills_cells_with_color() {
-    let (device, queue) = make_device();
-    let mut renderer = Renderer::new(&device, &queue, FORMAT);
-    renderer.resize(&device, W, H);
+fn field_fills_cells_with_color(device: &wgpu::Device, queue: &wgpu::Queue) {
+    let mut renderer = Renderer::new(device, queue, FORMAT);
+    renderer.resize(device, W, H);
 
     // 2x2 grid: bottom-left red, bottom-right green, top-left blue, top-right white.
     // Row-major from bottom-left: i=0 BL, i=1 BR, i=2 TL, i=3 TR.
@@ -435,8 +493,8 @@ fn field_fills_cells_with_color() {
         cells: &cells,
     }];
     let rb = render_scene(
-        &device,
-        &queue,
+        device,
+        queue,
         &mut renderer,
         &SceneParams::default(),
         &layers,
@@ -460,11 +518,9 @@ fn field_fills_cells_with_color() {
     );
 }
 
-#[test]
-fn feedback_path_runs_and_draws() {
-    let (device, queue) = make_device();
-    let mut renderer = Renderer::new(&device, &queue, FORMAT);
-    renderer.resize(&device, W, H);
+fn feedback_path_runs_and_draws(device: &wgpu::Device, queue: &wgpu::Queue) {
+    let mut renderer = Renderer::new(device, queue, FORMAT);
+    renderer.resize(device, W, H);
 
     // Draw a rect with feedback active over two frames; the surface must show the geometry,
     // and no validation error must fire (the panicking hook guards that).
@@ -486,16 +542,17 @@ fn feedback_path_runs_and_draws() {
         ..SceneParams::default()
     };
 
-    // Two frames so the ping-pong + decay path is exercised, plus the surface blit.
-    let (texture, view) = make_target(&device);
+    // Two frames so the ping-pong + decay path is exercised (the second frame decays the
+    // first one's accumulator while writing the surface in the same pass).
+    let (texture, view) = make_target(device);
     for _ in 0..2 {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("gpu-smoke-fb-frame"),
         });
-        renderer.render(&device, &queue, &mut encoder, &view, &params, &layers);
+        renderer.render(device, queue, &mut encoder, &view, &params, &layers);
         queue.submit(std::iter::once(encoder.finish()));
     }
-    let rb = read_texture(&device, &queue, &texture);
+    let rb = read_texture(device, queue, &texture);
 
     // Center should show the (accumulated) orange geometry, not clear.
     let center = rb.at_ndc(0.0, 0.0);
@@ -509,21 +566,19 @@ fn feedback_path_runs_and_draws() {
     );
 }
 
-#[test]
-fn resize_is_glitch_free_clear() {
-    let (device, queue) = make_device();
-    let mut renderer = Renderer::new(&device, &queue, FORMAT);
-    renderer.resize(&device, W, H);
+fn resize_is_glitch_free_clear(device: &wgpu::Device, queue: &wgpu::Queue) {
+    let mut renderer = Renderer::new(device, queue, FORMAT);
+    renderer.resize(device, W, H);
     // Resize again (reallocates feedback targets) then render with feedback: must not error
     // and the empty scene must read back as the clear color (no garbage flash).
-    renderer.resize(&device, W, H + 64); // change height to force reallocation
-    renderer.resize(&device, W, H); // back to the readback size
+    renderer.resize(device, W, H + 64); // change height to force reallocation
+    renderer.resize(device, W, H); // back to the readback size
 
     let params = SceneParams {
         feedback_decay: Some(0.9),
         ..SceneParams::default()
     };
-    let rb = render_scene(&device, &queue, &mut renderer, &params, &[]);
+    let rb = render_scene(device, queue, &mut renderer, &params, &[]);
     let center = rb.at_ndc(0.0, 0.0);
     assert!(
         is_clearish(center),
@@ -531,18 +586,19 @@ fn resize_is_glitch_free_clear() {
     );
 }
 
-#[test]
-fn transparent_bg_clears_alpha_to_zero_on_direct_and_feedback_paths() {
-    let (device, queue) = make_device();
-    let mut renderer = Renderer::new(&device, &queue, FORMAT);
-    renderer.resize(&device, W, H);
+fn transparent_bg_clears_alpha_to_zero_on_direct_and_feedback_paths(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) {
+    let mut renderer = Renderer::new(device, queue, FORMAT);
+    renderer.resize(device, W, H);
 
     // Direct path with transparent_bg: background pixel must be RGBA (0, 0, 0, 0).
     let direct_params = SceneParams {
         feedback_decay: None,
         transparent_bg: true,
     };
-    let rb = render_scene(&device, &queue, &mut renderer, &direct_params, &[]);
+    let rb = render_scene(device, queue, &mut renderer, &direct_params, &[]);
     assert_eq!(
         rb.at_ndc(0.0, 0.0),
         [0, 0, 0, 0],
@@ -555,16 +611,153 @@ fn transparent_bg_clears_alpha_to_zero_on_direct_and_feedback_paths() {
         feedback_decay: Some(0.9),
         transparent_bg: false,
     };
-    let _ = render_scene(&device, &queue, &mut renderer, &opaque_fb, &[]);
+    let _ = render_scene(device, queue, &mut renderer, &opaque_fb, &[]);
 
     let transparent_fb = SceneParams {
         feedback_decay: Some(0.9),
         transparent_bg: true,
     };
-    let rb_fb = render_scene(&device, &queue, &mut renderer, &transparent_fb, &[]);
+    let rb_fb = render_scene(device, queue, &mut renderer, &transparent_fb, &[]);
     assert_eq!(
         rb_fb.at_ndc(0.0, 0.0),
         [0, 0, 0, 0],
         "feedback transparent clear after toggle must produce zero alpha"
+    );
+}
+
+/// `res²` distinct opaque-or-not colors: every channel varies across cells.
+fn field_cells(res: u32, alpha: f32) -> Vec<[f32; 4]> {
+    (0..res * res)
+        .map(|i| {
+            let f = |k: u32| ((i * k + 11) % 97) as f32 / 96.0;
+            [f(7), f(13), f(29), alpha]
+        })
+        .collect()
+}
+
+/// A full-screen opaque rect, used as a non-black background or as prior content.
+const BACKDROP: [InstanceData; 1] = [InstanceData {
+    x: 0.0,
+    y: 0.0,
+    w: 2.0,
+    h: 2.0,
+    rot: 0.0,
+    color: [0.35, 0.25, 0.15, 1.0],
+}];
+
+/// The [`BACKDROP`] layer.
+fn backdrop() -> LayerDraw<'static> {
+    LayerDraw::Instanced {
+        shape: ShapeKind::Rect,
+        blend: BlendMode::Alpha,
+        instances: &BACKDROP,
+    }
+}
+
+/// Asserts two readbacks are identical, reporting the first differing pixel.
+fn assert_same_pixels(a: &Readback, b: &Readback, what: &str) {
+    if let Some((i, (pa, pb))) = a
+        .pixels
+        .iter()
+        .zip(&b.pixels)
+        .enumerate()
+        .find(|(_, (pa, pb))| pa != pb)
+    {
+        panic!(
+            "{what}: pixel ({}, {}) differs: {pa:?} vs {pb:?}",
+            i as u32 % a.width,
+            i as u32 / a.width
+        );
+    }
+}
+
+/// A leading alpha field with every cell at alpha 1 is drawn unblended and replaces the
+/// feedback decay draw. Its output must equal the same field drawn blended over the
+/// decayed accumulator, which a preceding empty instanced layer forces (the field is then
+/// not the first layer).
+fn leading_opaque_field_matches_blended_draw_under_feedback(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) {
+    let cells = field_cells(8, 1.0);
+    let field = || LayerDraw::Field {
+        blend: BlendMode::Alpha,
+        resolution: 8,
+        cells: &cells,
+    };
+    let empty = LayerDraw::Instanced {
+        shape: ShapeKind::Rect,
+        blend: BlendMode::Alpha,
+        instances: &[],
+    };
+    let params = SceneParams {
+        feedback_decay: Some(0.9),
+        ..SceneParams::default()
+    };
+
+    // Frame 1 leaves non-trivial history in the accumulator; frame 2 draws the field.
+    let render_two_frames = |second: &[LayerDraw]| {
+        let mut renderer = Renderer::new(device, queue, FORMAT);
+        renderer.resize(device, W, H);
+        let _ = render_scene(device, queue, &mut renderer, &params, &[backdrop()]);
+        render_scene(device, queue, &mut renderer, &params, second)
+    };
+    let leading = render_two_frames(&[field()]);
+    let blended = render_two_frames(&[empty, field()]);
+
+    assert_same_pixels(&leading, &blended, "leading opaque field vs blended");
+    assert_ne!(
+        leading.at_ndc(-0.9, -0.9),
+        leading.at_ndc(0.9, 0.9),
+        "the field's cells must be visible"
+    );
+}
+
+/// Cells missing from a partial field (`cells.len() < res²`) are uploaded as zeros, which
+/// additive blending leaves as a no-op: the output must equal the same field with the
+/// missing cells passed explicitly as `[0; 4]`, over a non-black background.
+fn partial_field_matches_zero_padded_field_under_add(device: &wgpu::Device, queue: &wgpu::Queue) {
+    let res = 4;
+    let partial = field_cells(res, 0.8)[..10].to_vec();
+    let mut padded = partial.clone();
+    padded.resize((res * res) as usize, [0.0; 4]);
+
+    let render_field = |cells: &[[f32; 4]]| {
+        let mut renderer = Renderer::new(device, queue, FORMAT);
+        renderer.resize(device, W, H);
+        let layers = [
+            backdrop(),
+            LayerDraw::Field {
+                blend: BlendMode::Add,
+                resolution: res,
+                cells,
+            },
+        ];
+        render_scene(
+            device,
+            queue,
+            &mut renderer,
+            &SceneParams::default(),
+            &layers,
+        )
+    };
+    let rb_partial = render_field(&partial);
+    let rb_padded = render_field(&padded);
+
+    assert_same_pixels(
+        &rb_partial,
+        &rb_padded,
+        "partial field vs zero-padded field",
+    );
+    // Cell 15 (top-right) is missing: the backdrop shows. Cell 0 (bottom-left) is drawn.
+    let missing = rb_partial.at_ndc(0.75, 0.75);
+    assert!(
+        !is_clearish(missing),
+        "missing cells must leave the non-black backdrop, got {missing:?}"
+    );
+    assert_ne!(
+        rb_partial.at_ndc(-0.75, -0.75),
+        missing,
+        "present cells must add onto the backdrop"
     );
 }
