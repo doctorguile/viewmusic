@@ -3412,6 +3412,8 @@ dependencies = [
  "egui-wgpu",
  "egui-winit",
  "indexmap",
+ "libc",
+ "png",
  "pollster",
  "serde",
  "serde_json",
