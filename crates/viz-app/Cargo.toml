@@ -32,10 +32,13 @@ bytemuck = { workspace = true }
 pollster = { workspace = true }
 
 [dev-dependencies]
-# examples/perf_harness.rs: process footprint/CPU (proc_pid_rusage, getrusage) and
-# correctness-dump PNG I/O.
-libc = "0.2"
+# examples/perf_harness.rs: correctness-dump PNG I/O.
 png = "0.18"
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+# examples/perf_harness.rs and live_harness.rs (macOS-only): process footprint/CPU
+# (proc_pid_rusage, getrusage) and thread QoS.
+libc = "0.2"
 
 [features]
 perf-hud = []
