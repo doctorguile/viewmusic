@@ -280,7 +280,6 @@ const CLEAR_COLOR_TRANSPARENT: wgpu::Color = wgpu::Color::TRANSPARENT;
 /// app's `device`/`queue`/`surface_format`; drive [`Renderer::render`] each frame from
 /// the `RenderCallback`; call [`Renderer::resize`] on surface resize.
 pub struct Renderer {
-    format: wgpu::TextureFormat,
     width: u32,
     height: u32,
 
@@ -314,7 +313,6 @@ impl Renderer {
         let feedback = feedback::Feedback::new(device, surface_format, width, height, direct);
         let _ = queue; // queue not needed at construction; kept for API symmetry.
         Self {
-            format: surface_format,
             width,
             height,
             instanced,
@@ -331,8 +329,9 @@ impl Renderer {
         self.upload.recall();
     }
 
-    /// Reallocates size-dependent targets for a new surface size (glitch-free: the
-    /// feedback texture is recreated and cleared so no garbage flashes during a resize).
+    /// Resizes size-dependent targets for a new surface size (glitch-free: the feedback
+    /// textures are reallocated and cleared on their next active frame, so no garbage
+    /// flashes).
     ///
     /// Zero dimensions are clamped to 1 to keep wgpu happy on a minimized window.
     pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
@@ -343,7 +342,8 @@ impl Renderer {
         }
         self.width = width;
         self.height = height;
-        self.feedback.resize(device, self.format, width, height);
+        let _ = device; // the feedback textures reallocate lazily on their next active frame.
+        self.feedback.resize(width, height);
         tracing::debug!(width, height, "viz-render: resized targets");
     }
 
@@ -395,8 +395,8 @@ impl Renderer {
 
         match active_decay {
             None => {
-                // Mark accumulators dirty so re-enabling feedback later clears stale history.
-                self.feedback.mark_dirty();
+                // Re-enabling feedback later clears stale history; a long idle run frees it.
+                self.feedback.note_inactive_frame();
                 // Direct path: clear surface, draw layers on top.
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("viz-render-direct"),
@@ -420,8 +420,10 @@ impl Renderer {
                 // Queue the decay scalar (cached) before recording the pass that reads it.
                 self.feedback
                     .set_decay(device, &mut self.upload, encoder, decay);
-                // Clear accumulators lazily if resized, bypassed, or transparency toggled.
-                self.feedback.prepare_frame(encoder, params.transparent_bg);
+                // Allocate accumulators if needed; clear them if fresh, bypassed, or
+                // transparency toggled.
+                self.feedback
+                    .prepare_frame(device, encoder, params.transparent_bg);
                 // One pass draws `prev * decay` fullscreen AND all layers into both `curr`
                 // and the surface, so no blit pass has to copy `curr` to the surface.
                 {

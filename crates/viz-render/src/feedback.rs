@@ -14,10 +14,12 @@
 //! the roles swap so next frame's `prev` is this frame's result. Both textures use the
 //! surface format and are both sampleable + renderable.
 //!
-//! ## Glitch-free resize
-//! [`Feedback::resize`] reallocates both textures and **clears** them in the same call, so
-//! no garbage from a stale-sized texture ever flashes during a resize. The roles are also
-//! reset deterministically.
+//! ## Lazy allocation, glitch-free resize
+//! The textures are allocated by the first active frame, freed after
+//! [`RELEASE_AFTER_INACTIVE_FRAMES`] consecutive frames without feedback, and dropped by
+//! [`Feedback::resize`] so the next active frame reallocates them at the new size. A fresh
+//! pair is always cleared before it is first sampled, so no garbage ever flashes, and the
+//! roles are reset deterministically.
 
 use std::num::NonZeroU64;
 
@@ -27,16 +29,28 @@ use crate::{PassTargets, CLEAR_COLOR, CLEAR_COLOR_TRANSPARENT};
 /// Size of the decay uniform: one f32, padded to 16 bytes (uniform alignment).
 const DECAY_BYTES: NonZeroU64 = NonZeroU64::new(16).unwrap();
 
-/// Two-texture ping-pong accumulator + the fullscreen decay pipeline.
-///
-/// Sizing is owned by [`crate::Renderer`]; this struct only holds the GPU resources and
-/// reallocates them on [`Feedback::resize`].
-pub struct Feedback {
-    /// The two accumulator textures and their views. Index by the `prev`/`curr` selectors.
-    textures: [wgpu::Texture; 2],
+/// Consecutive feedback-free frames after which the accumulators are freed (~5 s at
+/// 60 Hz). Long enough that degrade's feedback shedding does not churn allocations.
+const RELEASE_AFTER_INACTIVE_FRAMES: u32 = 300;
+
+/// The two ping-pong textures. Index by the `prev`/`curr` selectors.
+struct Accumulators {
+    /// Owned so the textures live exactly as long as this pair.
+    _textures: [wgpu::Texture; 2],
     views: [wgpu::TextureView; 2],
     /// Bind group that samples `textures[k]` (so `sample_bind[prev]` reads the prev image).
     sample_bind: [wgpu::BindGroup; 2],
+}
+
+/// Lazily allocated two-texture ping-pong accumulator + the fullscreen decay pipeline.
+///
+/// Sizing is owned by [`crate::Renderer`], which reports it via [`Feedback::resize`].
+pub struct Feedback {
+    /// `None` until the first active frame, after resize, and after a long inactive run.
+    accumulators: Option<Accumulators>,
+    format: wgpu::TextureFormat,
+    width: u32,
+    height: u32,
 
     /// Which texture index currently holds the previous frame's accumulation.
     prev: usize,
@@ -67,11 +81,14 @@ pub struct Feedback {
     last_transparent: bool,
     /// Decay value in `decay_copy_target`, so an unchanged decay skips the copy.
     last_decay: Option<f32>,
+    /// Consecutive frames rendered without feedback.
+    inactive_frames: u32,
 }
 
 impl Feedback {
-    /// Builds the pipelines, sampler, and the two accumulator textures at `width × height`
-    /// (and the decay copy target unless uploads are `direct`).
+    /// Builds the pipelines, sampler, and the decay copy target unless uploads are
+    /// `direct`; the accumulators are allocated at `width × height` by the first active
+    /// frame.
     pub fn new(
         device: &wgpu::Device,
         format: wgpu::TextureFormat,
@@ -179,13 +196,11 @@ impl Feedback {
             cache: None,
         });
 
-        let (textures, views, sample_bind) =
-            Self::make_targets(device, format, width, height, &bind_layout, &sampler);
-
         Self {
-            textures,
-            views,
-            sample_bind,
+            accumulators: None,
+            format,
+            width,
+            height,
             prev: 0,
             sampler,
             bind_layout,
@@ -198,34 +213,24 @@ impl Feedback {
             dirty: true,
             last_transparent: false,
             last_decay: None,
+            inactive_frames: 0,
         }
     }
 
     /// Allocates the two accumulator textures + their views + sampling bind groups.
-    fn make_targets(
-        device: &wgpu::Device,
-        format: wgpu::TextureFormat,
-        width: u32,
-        height: u32,
-        bind_layout: &wgpu::BindGroupLayout,
-        sampler: &wgpu::Sampler,
-    ) -> (
-        [wgpu::Texture; 2],
-        [wgpu::TextureView; 2],
-        [wgpu::BindGroup; 2],
-    ) {
+    fn allocate(&self, device: &wgpu::Device) -> Accumulators {
         let make_tex = |label: &str| {
             device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(label),
                 size: wgpu::Extent3d {
-                    width: width.max(1),
-                    height: height.max(1),
+                    width: self.width.max(1),
+                    height: self.height.max(1),
                     depth_or_array_layers: 1,
                 },
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format,
+                format: self.format,
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                     | wgpu::TextureUsages::TEXTURE_BINDING
                     // COPY_SRC so the GPU smoke test can read this texture back too.
@@ -241,7 +246,7 @@ impl Feedback {
         let make_bind = |view: &wgpu::TextureView| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("feedback-sample-bind"),
-                layout: bind_layout,
+                layout: &self.bind_layout,
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
@@ -249,38 +254,31 @@ impl Feedback {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: wgpu::BindingResource::Sampler(sampler),
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
                     },
                 ],
             })
         };
         let sample_bind = [make_bind(&views[0]), make_bind(&views[1])];
-        (textures, views, sample_bind)
+        Accumulators {
+            _textures: textures,
+            views,
+            sample_bind,
+        }
     }
 
-    /// Reallocates both accumulators to a new size and clears them (glitch-free).
-    pub fn resize(
-        &mut self,
-        device: &wgpu::Device,
-        format: wgpu::TextureFormat,
-        width: u32,
-        height: u32,
-    ) {
-        let (textures, views, sample_bind) = Self::make_targets(
-            device,
-            format,
-            width,
-            height,
-            &self.bind_layout,
-            &self.sampler,
-        );
-        self.textures = textures;
-        self.views = views;
-        self.sample_bind = sample_bind;
-        self.prev = 0;
-        // Fresh textures have undefined contents; defer the clear to the next active frame
-        // (encoder available there), so resize needs no queue and never flashes garbage.
-        self.dirty = true;
+    fn accumulators(&self) -> &Accumulators {
+        self.accumulators
+            .as_ref()
+            .expect("prepare_frame allocates the accumulators")
+    }
+
+    /// Records the new size and drops the accumulators; the next active frame reallocates
+    /// and clears them.
+    pub fn resize(&mut self, width: u32, height: u32) {
+        self.width = width;
+        self.height = height;
+        self.accumulators = None;
     }
 
     /// Clears both accumulator textures to `clear_color` if they are dirty
@@ -290,7 +288,7 @@ impl Feedback {
         if !self.dirty {
             return;
         }
-        for view in &self.views {
+        for view in &self.accumulators().views {
             let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("feedback-clear-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -316,20 +314,37 @@ impl Feedback {
         1 - self.prev
     }
 
-    /// The view of the current render target (`curr`) — layers draw here.
+    /// The view of the current render target (`curr`) — layers draw here. Call after
+    /// [`Feedback::prepare_frame`].
     pub fn target_view(&self) -> &wgpu::TextureView {
-        &self.views[self.curr()]
+        &self.accumulators().views[self.curr()]
     }
 
-    /// Marks the accumulator textures dirty so they will be cleared before the next
-    /// active feedback frame (e.g., after bypassing feedback while `decay == 0`).
-    pub fn mark_dirty(&mut self) {
+    /// Records a frame rendered without feedback: the accumulators are cleared before the
+    /// next active frame, and freed once feedback has been off for long enough.
+    pub fn note_inactive_frame(&mut self) {
         self.dirty = true;
+        self.inactive_frames = self.inactive_frames.saturating_add(1);
+        if self.inactive_frames >= RELEASE_AFTER_INACTIVE_FRAMES {
+            self.accumulators = None;
+        }
     }
 
-    /// Prepares the accumulator textures for a merged decay+layers pass: clears both
-    /// accumulators if freshly allocated, bypassed, or if `transparent_bg` changed.
-    pub fn prepare_frame(&mut self, encoder: &mut wgpu::CommandEncoder, transparent_bg: bool) {
+    /// Prepares the accumulator textures for a merged decay+layers pass: allocates them if
+    /// needed, and clears both if freshly allocated, bypassed, or if `transparent_bg`
+    /// changed.
+    pub fn prepare_frame(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        transparent_bg: bool,
+    ) {
+        self.inactive_frames = 0;
+        if self.accumulators.is_none() {
+            self.accumulators = Some(self.allocate(device));
+            self.prev = 0;
+            self.dirty = true;
+        }
         if self.last_transparent != transparent_bg {
             self.last_transparent = transparent_bg;
             self.dirty = true;
@@ -348,7 +363,7 @@ impl Feedback {
     /// same pass.
     pub fn draw_decay<'p>(&'p self, pass: &mut wgpu::RenderPass<'p>) {
         pass.set_pipeline(&self.decay_pipeline);
-        pass.set_bind_group(0, &self.sample_bind[self.prev], &[]);
+        pass.set_bind_group(0, &self.accumulators().sample_bind[self.prev], &[]);
         let (bind_group, offset) = self.decay_bind;
         pass.set_bind_group(1, &self.decay_bind_groups[bind_group].1, &[offset]);
         pass.draw(0..3, 0..1);
@@ -400,5 +415,70 @@ impl Feedback {
     /// frame's accumulator.
     pub fn end_frame(&mut self) {
         self.prev = self.curr();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_device() -> (wgpu::Device, wgpu::Queue) {
+        let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
+        desc.backends = wgpu::Backends::METAL | wgpu::Backends::PRIMARY;
+        let instance = wgpu::Instance::new(desc);
+        let force_fallback =
+            std::env::var("VIEWMUSIC_FORCE_FALLBACK_ADAPTER").as_deref() == Ok("1");
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: force_fallback,
+            compatible_surface: None,
+        }))
+        .expect("no GPU adapter for headless test");
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("feedback-test-device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::downlevel_defaults(),
+            ..Default::default()
+        }))
+        .expect("failed to acquire wgpu device");
+        (device, queue)
+    }
+
+    #[test]
+    fn accumulators_allocate_lazily_and_release_after_inactive_run_or_resize() {
+        // The queue must outlive the encoder.
+        let (device, _queue) = make_device();
+        let mut encoder = device.create_command_encoder(&Default::default());
+        let mut feedback =
+            Feedback::new(&device, wgpu::TextureFormat::Bgra8UnormSrgb, 64, 32, false);
+        assert!(feedback.accumulators.is_none());
+
+        feedback.prepare_frame(&device, &mut encoder, false);
+        assert!(feedback.accumulators.is_some());
+        assert!(!feedback.dirty);
+
+        // A short bypass keeps the textures but clears them on return.
+        for _ in 1..RELEASE_AFTER_INACTIVE_FRAMES {
+            feedback.note_inactive_frame();
+        }
+        assert!(feedback.accumulators.is_some());
+        assert!(feedback.dirty);
+        feedback.prepare_frame(&device, &mut encoder, false);
+        assert!(!feedback.dirty);
+
+        for _ in 0..RELEASE_AFTER_INACTIVE_FRAMES {
+            feedback.note_inactive_frame();
+        }
+        assert!(feedback.accumulators.is_none());
+        feedback.prepare_frame(&device, &mut encoder, false);
+        assert!(feedback.accumulators.is_some());
+
+        feedback.resize(80, 40);
+        assert!(feedback.accumulators.is_none());
+        feedback.end_frame();
+        feedback.prepare_frame(&device, &mut encoder, false);
+        assert!(feedback.accumulators.is_some());
+        assert_eq!(feedback.prev, 0);
+        assert!(!feedback.dirty);
     }
 }
