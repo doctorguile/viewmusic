@@ -23,7 +23,7 @@
 //! Flags:
 //! - `--size WxH` (default 1512x945) window inner size in points; on the Retina
 //!   built-in display that is 3024x1890 px. The window opens on the primary display.
-//! - `--only id,id` restrict to these built-in artifact ids (default all 15).
+//! - `--only id,id` restrict to these built-in artifact ids (default all 17).
 //! - `--secs S` (default 10) measured seconds per artifact.
 //! - `--warmup-secs S` (default 2) unmeasured seconds per artifact before the window.
 //! - `--overlay` attach the egui overlay (`viz_app::overlay::Overlay`, placeholder
@@ -132,6 +132,14 @@ mod harness {
         (
             "breathing-grid (built-in)",
             include_str!("../../../assets/builtin-artifacts/breathing-grid.artifact.json"),
+        ),
+        (
+            "retro-spectrum-bars (built-in)",
+            include_str!("../../../assets/builtin-artifacts/retro-spectrum-bars.artifact.json"),
+        ),
+        (
+            "winamp-spectrum-bars (built-in)",
+            include_str!("../../../assets/builtin-artifacts/winamp-spectrum-bars.artifact.json"),
         ),
     ];
 

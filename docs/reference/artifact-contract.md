@@ -1,4 +1,4 @@
-# ViewMusic Artifact Contract — v1.0
+# ViewMusic Artifact Contract — v1.1
 
 The single published contract every visual artifact conforms to — built-in and user-created
 alike. Machine-readable schema: [`artifact.schema.json`](./artifact.schema.json)
@@ -55,7 +55,7 @@ operations per artifact.
 | Exp/log | `exp(x)`, `log(x)` (natural), `log2(x)`, `log10(x)`, `pow(x,y)`, `sqrt(x)` |
 | Shaping | `abs(x)`, `sign(x)`, `floor(x)`, `ceil(x)`, `round(x)`, `fract(x)`, `min(a,b)`, `max(a,b)`, `clamp(x,lo,hi)`, `mix(a,b,k)` (lerp), `smoothstep(e0,e1,x)`, `step(edge,x)` |
 | Conditional | `if(cond, then, else)` — true branch when `cond ≥ 0.5`; both branches are evaluated (pure, no side effects), so guard divisions: `if(d != 0, n/d, 0)` |
-| Audio | `band(u)`, `wave(u)` — see §3 |
+| Audio | `band(u)`, `level(u)` (v1.1), `peak(u)` (v1.1), `wave(u)` — see §3 |
 | Random | `rand(k)` — deterministic stateless hash of (artifact seed, `k`); uniform 0..1. **Same `k` ⇒ same value on every frame** — random values are stable unless you change `k`. Per-element stable randomness: fold the index into `k` (`rand(i)`, `rand(i + 100)` for a second independent value). Re-rolling over time is opt-in: fold a time-derived term into `k`, e.g. `rand(i + beat_count * 1000)` re-rolls each particle's value on every beat |
 | Constants | `pi`, `tau`, `e` |
 
@@ -76,6 +76,8 @@ Available in **all** stages:
 | `beat` | 0..1 | 1.0 on onset, exponential decay after |
 | `beat_count` | integer | Total onsets since artifact start |
 | `band(u)` | 0..1 | Spectrum lookup at normalized position u∈0..1 across 48 log-spaced bands (interpolated). Exact band k (0..47): `band(k/47)` |
+| `level(u)` | 0..1 | *(v1.1)* Shared-AGC musical dB-scaled spectrum level at u∈0..1 across 48 bands (interpolated). Exact band k (0..47): `level(k/47)` |
+| `peak(u)` | 0..1 | *(v1.1)* Peak-hold cap envelope of `level(u)` at u∈0..1 across 48 bands (interpolated). Exact band k (0..47): `peak(k/47)` |
 | `wave(u)` | −1..1 | Waveform lookup at u∈0..1 across the current 256-sample window (interpolated). Exact sample k (0..255): `wave(k/255)` |
 | `aspect` | >0 | Render width / height |
 | `settings.*` | varies | Each declared setting, read with the **`settings.` prefix** — `settings.name` (see §4 value mapping). A bare `name` is *not* the setting; only vars are read bare (next row) |
@@ -96,15 +98,15 @@ in the same units. **Circle idiom** — coordinates stretch with the window, so 
 `x = cx + r * cos(a) / aspect`, `y = cy + r * sin(a)` — and likewise `w = d / aspect`,
 `h = d` to keep an element visually square.
 
-**Note on `band(u)`/`wave(u)` arguments**: their `u` is *any* expression in 0..1 you choose —
+**Note on `band(u)`/`level(u)`/`peak(u)`/`wave(u)` arguments**: their `u` is *any* expression in 0..1 you choose —
 it does not have to be the element's `u`. `band(0.5)` samples mid-spectrum from any stage;
-`band(u)` maps element position onto the spectrum.
+`band(u)` or `level(u)` maps element position onto the spectrum.
 
 ## 3. Audio semantics
 
 Features refresh ~94×/s from the live system mix; the renderer always reads the newest frame.
 During silence the app feeds **zeroed features** (`energy`, `low/mid/high`, `band()`,
-`wave()`, `beat` all → 0) — but **`t` and `dt` keep advancing** (the audio clock never
+`level()`, `peak()`, `wave()`, `beat` all → 0) — but **`t` and `dt` keep advancing** (the audio clock never
 stops). Write artifacts so zero input produces a calm idle look: gate motion and
 brightness by the audio, not just by time. Idiom — multiply velocities, sizes, or alpha by
 `energy` (or `smoothstep(0.02, 0.1, energy)` for a clean fade): when sound stops, the scene
@@ -162,8 +164,11 @@ optional `"visible"`: Formula (default 1; < 0.5 skips the layer this frame).
 }
 ```
 
-`shape`: `"rect" | "circle" | "triangle"` (all **filled**; for a ring *outline* use a
-closed `polyline`, §6.2). `count`: per-frame Formula — **floored** to an integer, then
+`shape`: `"rect" | "circle" | "triangle" | "pill" | "glow"` (`"rect"`, `"circle"`,
+`"triangle"` are filled; `"pill"` *(v1.1)* is an aspect-true anti-aliased rounded stadium
+segment with subtle core shading; `"glow"` *(v1.1)* is a smooth radial optical bloom quad
+fading cleanly to 0 before the quad boundary — pair with `"blend": "add"`; for a ring
+*outline* use a closed `polyline`, §6.2). `count`: per-frame Formula — **floored** to an integer, then
 clamped 1..4096. The clamp floor is 1, so `count` can never reach 0: a `count` that
 evaluates to 0 (e.g. `count: settings.some_toggle`) still draws one instance. To make a
 layer disappear, gate it with `visible` (< 0.5 skips the whole layer, §6), not with
@@ -254,6 +259,10 @@ loud — `"colour"` won't silently no-op; this is why newer-MINOR files are reje
 than half-understood). MINOR bumps add optional capabilities; MAJOR bumps may break shape.
 The version check runs before schema validation, so out-of-range files log a clear
 `unsupported contract version X.Y`, not a schema pattern error.
+
+**v1.1 additions** (backward-compatible with v1.0): audio functions `level(u)` and `peak(u)`,
+and `instanced` shapes `"pill"` and `"glow"`. Artifacts using any of these should declare
+`"contract": "1.1"`.
 
 ## 11. Diagnostics
 

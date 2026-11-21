@@ -16,7 +16,7 @@
 //!   truthy when `>= 0.5`; yield `0`/`1`), and parentheses.
 //! - **Functions**: `sin cos tan asin acos atan atan2 exp log log2 log10 pow
 //!   sqrt abs sign floor ceil round fract min max clamp mix smoothstep step if
-//!   band wave rand`. Constants: `pi tau e`. Function arity is checked at
+//!   band level peak wave rand`. Constants: `pi tau e`. Function arity is checked at
 //!   parse/compile time. `if(cond, then, else)` evaluates **both** branches
 //!   (pure dataflow, contract §2.2) and selects on `cond >= 0.5`.
 //! - **Numbers**: JSON-style decimal literals (`12`, `1.5`, `.5`, `2.5e-3`).
@@ -245,6 +245,84 @@ mod tests {
         assert!((vm.eval(&prog) - (0.25 - 0.5)).abs() < 1e-7);
     }
 
+    #[test]
+    fn level_peak_use_frame_scalar_and_batch() {
+        use viz_core::FeatureFrame;
+        let scope = test_scope();
+        let i_slot = scope.slot_id("i").unwrap();
+        let u_slot = scope.slot_id("u").unwrap();
+
+        let mut frame = FeatureFrame::default();
+        for k in 0..frame.bands_db.len() {
+            frame.bands_db[k] = k as f32 / 47.0;
+            frame.band_peaks[k] = ((k as f32 / 47.0) + 0.15).min(1.0);
+        }
+
+        // Scalar evaluation via Vm::eval (including midpoint interpolation, clamping, and NaN arg).
+        let prog_level = compile("level(u)", &scope).unwrap();
+        let prog_peak = compile("peak(u)", &scope).unwrap();
+        let prog_nan = compile("level(0 / 0) + peak(1 / 0)", &scope).unwrap();
+
+        let mut vm = Vm::new(scope.slot_count(), 0);
+        vm.set_frame(&frame);
+
+        let us = [-0.25, 0.0, 0.5 / 47.0, 0.5, 1.0, 1.5];
+        for &u in &us {
+            vm.set_slot(u_slot, u);
+            assert_eq!(vm.eval(&prog_level).to_bits(), frame.level(u).to_bits());
+            assert_eq!(vm.eval(&prog_peak).to_bits(), frame.peak(u).to_bits());
+        }
+        // Non-finite arguments sanitize to 0.0 -> frame.level(0.0) + frame.peak(0.0).
+        assert_eq!(
+            vm.eval(&prog_nan).to_bits(),
+            (frame.level(0.0) + frame.peak(0.0)).to_bits()
+        );
+
+        // Batch evaluation via compile_multi + eval_multi_batch must match scalar bitwise.
+        let inputs = [
+            MultiInput::Expr("level(u)"),
+            MultiInput::Expr("peak(u)"),
+            MultiInput::Expr("max(level(u), peak(u)) - level(0.5)"),
+        ];
+        let mp = compile_multi(&inputs, &scope, &[i_slot, u_slot], None, None).unwrap();
+
+        let mut seed_outs = [0.0f64; MAX_MULTI_OUTS];
+        vm.eval_multi_hoisted(&mp, &mut seed_outs);
+
+        let lanes = us.len();
+        let [la, lb] = vm.batch_slot_lanes_mut();
+        for (k, &u) in us.iter().enumerate() {
+            la[k] = k as f64;
+            lb[k] = u;
+        }
+        vm.eval_multi_batch(&mp, lanes, [Some(i_slot), Some(u_slot)], &[], &seed_outs);
+
+        let batch_level: Vec<u64> = vm.batch_outs()[0][..lanes]
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+        let batch_peak: Vec<u64> = vm.batch_outs()[1][..lanes]
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+        let batch_combo: Vec<u64> = vm.batch_outs()[2][..lanes]
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+
+        let mut scalar_outs = seed_outs;
+        for (k, &u) in us.iter().enumerate() {
+            vm.set_slot(i_slot, k as f64);
+            vm.set_slot(u_slot, u);
+            vm.eval_multi_item(&mp, &mut scalar_outs);
+            assert_eq!(batch_level[k], scalar_outs[0].to_bits());
+            assert_eq!(batch_peak[k], scalar_outs[1].to_bits());
+            assert_eq!(batch_combo[k], scalar_outs[2].to_bits());
+            assert_eq!(batch_level[k], frame.level(u).to_bits());
+            assert_eq!(batch_peak[k], frame.peak(u).to_bits());
+        }
+    }
+
     // ---- Caps ------------------------------------------------------------
 
     #[test]
@@ -345,6 +423,8 @@ mod tests {
         assert!(b.slot("foo").is_ok());
         assert!(matches!(b.slot("foo"), Err(ScopeError::Duplicate(_))));
         assert!(matches!(b.slot("sin"), Err(ScopeError::ReservedName(_))));
+        assert!(matches!(b.slot("level"), Err(ScopeError::ReservedName(_))));
+        assert!(matches!(b.slot("peak"), Err(ScopeError::ReservedName(_))));
         assert!(matches!(b.slot("pi"), Err(ScopeError::ReservedName(_))));
         assert!(matches!(b.slot(""), Err(ScopeError::EmptyName)));
     }

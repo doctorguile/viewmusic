@@ -48,6 +48,8 @@ pub enum BuiltinOp {
     Step,
     If,
     Band,
+    Level,
+    Peak,
     Wave,
     Rand,
 }
@@ -189,6 +191,16 @@ pub const BUILTINS: &[BuiltinFn] = &[
         name: "band",
         arity: 1,
         op: BuiltinOp::Band,
+    },
+    BuiltinFn {
+        name: "level",
+        arity: 1,
+        op: BuiltinOp::Level,
+    },
+    BuiltinFn {
+        name: "peak",
+        arity: 1,
+        op: BuiltinOp::Peak,
     },
     BuiltinFn {
         name: "wave",

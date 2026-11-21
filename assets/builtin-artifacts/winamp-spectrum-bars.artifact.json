@@ -1,0 +1,301 @@
+{
+  "contract": "1.1",
+  "meta": {
+    "id": "winamp-spectrum-bars",
+    "name": "Winamp Spectrum Bars",
+    "description": "Authentic Winamp 2.x spectrum analyzer faithfully calibrated from classic .wsz skin packs (Winamp Classic 2.91, Green Dimension V2, TopazAmp, Mac OS X Aqua, XMMS Turquoise, Zaxon Remake, and Vizor Bronze) with recessed 3D bevel housing, blue L-axis scale ruler, dot-matrix cavity grid, CRT phosphor bloom, and hardware peak hold.",
+    "author": "ViewMusic built-in"
+  },
+  "settings": {
+    "skin": {
+      "type": "choice",
+      "label": "Skin",
+      "options": [
+        "Winamp Classic (2.91)",
+        "Green Dimension V2",
+        "TopazAmp",
+        "Mac OS X Aqua",
+        "XMMS Turquoise",
+        "Zaxon Remake",
+        "Vizor Bronze"
+      ],
+      "default": "Winamp Classic (2.91)"
+    },
+    "mode": {
+      "type": "choice",
+      "label": "Display mode",
+      "options": [
+        "Classic Bars",
+        "Segmented CRT",
+        "Fire",
+        "Peaks Only"
+      ],
+      "default": "Classic Bars"
+    },
+    "bars": {
+      "type": "number",
+      "label": "Bars",
+      "min": 10,
+      "max": 38,
+      "step": 1,
+      "default": 19
+    },
+    "crtGlow": {
+      "type": "number",
+      "label": "CRT bloom",
+      "min": 0.0,
+      "max": 1.5,
+      "step": 0.05,
+      "default": 0.65
+    },
+    "housing": {
+      "type": "toggle",
+      "label": "Skin housing",
+      "default": true
+    },
+    "showGrid": {
+      "type": "toggle",
+      "label": "Dot grid",
+      "default": true
+    },
+    "showPeaks": {
+      "type": "toggle",
+      "label": "Peak hold",
+      "default": true
+    },
+    "gain": {
+      "type": "number",
+      "label": "Input gain",
+      "min": 0.5,
+      "max": 2.0,
+      "step": 0.05,
+      "default": 1.1
+    }
+  },
+  "vars": {
+    "s0": { "init": 1, "frame": "settings.skin == 0" },
+    "s1": { "init": 0, "frame": "settings.skin == 1" },
+    "s2": { "init": 0, "frame": "settings.skin == 2" },
+    "is_light": { "init": 0, "frame": "settings.skin == 3" },
+    "s4": { "init": 0, "frame": "settings.skin == 4" },
+    "s5": { "init": 0, "frame": "settings.skin == 5" },
+    "s6": { "init": 0, "frame": "settings.skin == 6" },
+
+    "is_seg": { "init": 0, "frame": "settings.mode == 1" },
+    "is_fire": { "init": 0, "frame": "settings.mode == 2" },
+    "is_peaks": { "init": 0, "frame": "settings.mode == 3" },
+
+    "cols": { "init": 19, "frame": "round(settings.bars)" },
+    "x0": { "init": -0.74, "frame": "-0.77 + 0.03 * settings.housing" },
+    "y0": { "init": -0.64, "frame": "-0.67 + 0.03 * settings.housing" },
+    "cell_w": { "init": 0.0811, "frame": "1.54 / cols" },
+    "bar_w": { "init": 0.0616, "frame": "cell_w * (0.76 - 0.04 * is_seg)" },
+    "seg_h": { "init": 0.0737, "frame": "0.08375 * if(is_seg, 0.68, 0.88)" },
+    "k2": { "init": 0.56, "frame": "s0 * 0.56 + s2 * 0.84 + (1 - s0 - s2) * 0.68" },
+    "blm_s": { "init": 0.24, "frame": "s0 * 0.24 + s1 * 0.30 + s2 * 0.20 + s4 * 0.26 + s5 * 0.08 + s6 * 0.18" },
+
+    "ch_r": { "init": 0.0152, "frame": "s0 * 0.0152 + s2 * 0.043 + is_light * 0.8355 + s4 * 0.0231 + s5 * 0.2428 + s6 * 0.148" },
+    "ch_g": { "init": 0.0161, "frame": "s0 * 0.0161 + s2 * 0.0528 + is_light * 0.8355 + s4 * 0.0231 + s5 * 0.259 + s6 * 0.0987" },
+    "ch_b": { "init": 0.0415, "frame": "s0 * 0.0415 + s2 * 0.0385 + is_light * 0.8355 + s4 * 0.0231 + s5 * 0.2758 + s6 * 0.0638" },
+
+    "bv0_r": { "init": 0.0, "frame": "s2 * 0.0008 + is_light * 0.3297 + s4 * 0.0004 + s5 * 0.0005 + s6 * 0.0199" },
+    "bv0_g": { "init": 0.0, "frame": "s1 * 0.0697 + s2 * 0.0066 + is_light * 0.3297 + s4 * 0.0004 + s5 * 0.0008 + s6 * 0.0119" },
+    "bv0_b": { "init": 0.0, "frame": "s2 * 0.0055 + is_light * 0.3297 + s4 * 0.0004 + s5 * 0.0012 + s6 * 0.006" },
+
+    "bv1_r": { "init": 0.1604, "frame": "s0 * 0.1604 + s2 * 0.0619 + is_light * 0.7227 + s4 * 0.2047 + s5 * 0.4878 + s6 * 0.548" },
+    "bv1_g": { "init": 0.1604, "frame": "s0 * 0.1604 + s1 * 0.4423 + s2 * 0.3345 + is_light * 0.7227 + s4 * 0.2047 + s5 * 0.5295 + s6 * 0.2632" },
+    "bv1_b": { "init": 0.231, "frame": "s0 * 0.231 + s2 * 0.3021 + is_light * 0.7227 + s4 * 0.2047 + s5 * 0.5732 + s6 * 0.1062" },
+
+    "bg_r": { "init": 0.0, "frame": "s2 * 0.0078 + is_light * 1.0 + s4 * 0.0001 + s5 * 0.0638 + s6 * 0.0303" },
+    "bg_g": { "init": 0.0, "frame": "s2 * 0.037 + is_light * 1.0 + s4 * 0.001 + s5 * 0.0846 + s6 * 0.0104" },
+    "bg_b": { "init": 0.0, "frame": "s2 * 0.0329 + is_light * 1.0 + s4 * 0.0014 + s5 * 0.1011 + s6 * 0.0033" },
+
+    "dt_r": { "init": 0.0055, "frame": "s0 * 0.0055 + s2 * 0.0152 + is_light * 0.7445 + s4 * 0.0017 + s5 * 0.0356 + s6 * 0.0892" },
+    "dt_g": { "init": 0.0111, "frame": "s0 * 0.0111 + s1 * 0.0189 + s2 * 0.0892 + is_light * 0.7445 + s4 * 0.0356 + s5 * 0.0494 + s6 * 0.0356" },
+    "dt_b": { "init": 0.0179, "frame": "s0 * 0.0179 + s2 * 0.0781 + is_light * 0.7445 + s4 * 0.0254 + s5 * 0.0619 + s6 * 0.0119" },
+
+    "ax1_r": { "init": 0.1113, "frame": "s0 * 0.1113 + s2 * 0.7299 + is_light * 0.0461 + s4 * 0.0066 + s5 * 0.3787 + s6 * 0.5924" },
+    "ax1_g": { "init": 0.3066, "frame": "s0 * 0.3066 + s1 * 0.586 + s2 * 0.586 + is_light * 0.259 + s4 * 0.7667 + s5 * 0.4704 + s6 * 0.2932" },
+    "ax1_b": { "init": 0.8277, "frame": "s0 * 0.8277 + s2 * 0.3392 + is_light * 0.673 + s4 * 0.4995 + s5 * 0.5605 + s6 * 0.122" },
+
+    "ax0_r": { "init": 0.0, "frame": "s2 * 0.0399 + is_light * 0.3066 + s4 * 0.0026 + s5 * 0.142 + s6 * 0.148" },
+    "ax0_g": { "init": 0.0824, "frame": "s0 * 0.0824 + s1 * 0.0697 + s2 * 0.2508 + is_light * 0.5295 + s4 * 0.3066 + s5 * 0.1801 + s6 * 0.06" },
+    "ax0_b": { "init": 0.2349, "frame": "s0 * 0.2349 + s2 * 0.2195 + is_light * 0.8122 + s4 * 0.2011 + s5 * 0.2233 + s6 * 0.0231" },
+
+    "c0_r": { "init": 0.0055, "frame": "s0 * 0.0055 + s2 * 0.022 + is_light * 0.1768 + s4 * 0.0002 + s5 * 0.2508 + s6 * 0.1801" },
+    "c0_g": { "init": 0.2349, "frame": "s0 * 0.2349 + s1 * 0.3993 + s2 * 0.1275 + is_light * 0.6055 + s4 * 0.0356 + s5 * 0.3204 + s6 * 0.0824" },
+    "c0_b": { "init": 0.0005, "frame": "s0 * 0.0005 + s2 * 0.1011 + is_light * 0.9158 + s4 * 0.0278 + s5 * 0.3889 + s6 * 0.0316" },
+
+    "c1_r": { "init": 0.0179, "frame": "s0 * 0.0179 + s2 * 0.0677 + is_light * 0.0638 + s4 * 0.0002 + s5 * 0.2888 + s6 * 0.3392" },
+    "c1_g": { "init": 0.6253, "frame": "s0 * 0.6253 + s1 * 0.2632 + s2 * 0.3587 + is_light * 0.2932 + s4 * 0.1275 + s5 * 0.3686 + s6 * 0.1734" },
+    "c1_b": { "init": 0.0023, "frame": "s0 * 0.0023 + s2 * 0.3112 + is_light * 0.7299 + s4 * 0.1011 + s5 * 0.4368 + s6 * 0.0697" },
+
+    "c2_r": { "init": 0.7818, "frame": "s0 * 0.7818 + s2 * 0.1573 + is_light * 0.2271 + s4 * 0.0005 + s5 * 0.344 + s6 * 0.5795" },
+    "c2_g": { "init": 0.5605, "frame": "s0 * 0.5605 + s1 * 0.145 + s2 * 0.6524 + is_light * 0.4479 + s4 * 0.2932 + s5 * 0.4259 + s6 * 0.3112" },
+    "c2_b": { "init": 0.0066, "frame": "s0 * 0.0066 + s2 * 0.586 + is_light * 0.7893 + s4 * 0.2388 + s5 * 0.5054 + s6 * 0.1247" },
+
+    "c3_r": { "init": 0.8671, "frame": "s0 * 0.8671 + s2 * 0.7299 + is_light * 0.1139 + s4 * 0.0012 + s5 * 0.5295 + s6 * 0.68" },
+    "c3_g": { "init": 0.0265, "frame": "s0 * 0.0265 + s1 * 0.0658 + s2 * 0.586 + is_light * 0.2758 + s4 * 0.5356 + s5 * 0.6456 + s6 * 0.4878" },
+    "c3_b": { "init": 0.0023, "frame": "s0 * 0.0023 + s2 * 0.3392 + is_light * 0.6941 + s4 * 0.4423 + s5 * 0.7445 + s6 * 0.212" },
+
+    "pk_r": { "init": 0.3112, "frame": "s0 * 0.3112 + s2 * 0.7227 + is_light * 0.0399 + s4 * 0.0008 + s5 * 0.6661 + s6 * 0.8592" },
+    "pk_g": { "init": 0.3112, "frame": "s0 * 0.3112 + s1 * 1.0 + s2 * 0.6524 + is_light * 0.2158 + s4 * 0.8122 + s5 * 0.7818 + s6 * 0.6661" },
+    "pk_b": { "init": 0.3112, "frame": "s0 * 0.3112 + s2 * 0.3345 + is_light * 0.6388 + s4 * 0.673 + s5 * 0.8751 + s6 * 0.3489" }
+  },
+  "scene": [
+    {
+      "type": "field",
+      "resolution": 64,
+      "blend": "alpha",
+      "visible": "settings.housing",
+      "cell": {
+        "color": {
+          "model": "rgba",
+          "r": "if(is_light, 1 - 0.04 * smoothstep(0.66, 0.82, y), bg_r * (1 - 0.22 * (x * x * 0.6 + y * y * 0.8)) + exp(-((x * 0.5 - y * 0.85 - 0.14) * 3.6)^2) * 0.0018 + sin(y * 190) * 0.0005)",
+          "g": "if(is_light, 1 - 0.04 * smoothstep(0.66, 0.82, y), bg_g * (1 - 0.22 * (x * x * 0.6 + y * y * 0.8)) + exp(-((x * 0.5 - y * 0.85 - 0.14) * 3.6)^2) * 0.0020 + sin(y * 190) * 0.0005)",
+          "b": "if(is_light, 1 - 0.04 * smoothstep(0.66, 0.82, y), bg_b * (1 - 0.22 * (x * x * 0.6 + y * y * 0.8)) + exp(-((x * 0.5 - y * 0.85 - 0.14) * 3.6)^2) * 0.0024 + sin(y * 190) * 0.0005)",
+          "a": 1
+        }
+      }
+    },
+    {
+      "type": "instanced",
+      "shape": "rect",
+      "blend": "alpha",
+      "count": 12,
+      "visible": "settings.housing",
+      "element": {
+        "x": "if(i == 2, -0.94, if(i == 3, 0.94, if(i == 6, -0.8725, if(i == 7, 0.8725, if(i == 10, -0.884, if(i == 11, 0.884, 0))))))",
+        "y": "if(i == 0, 0.91, if(i == 1, -0.91, if(i == 4, 0.807, if(i == 5, -0.807, if(i == 8, 0.824, if(i == 9, -0.824, 0))))))",
+        "w": "if(i < 2, 2.0, if(i < 4, 0.12, if(i < 6, 1.76, if(i < 8, 0.015, if(i < 10, 1.776, 0.006)))))",
+        "h": "if(i < 2, 0.18, if(i < 4, 1.64, if(i < 6, 0.026, if(i < 8, 1.64, if(i < 10, 0.008, 1.656)))))",
+        "color": {
+          "model": "rgba",
+          "r": "if(i < 4, ch_r, if(i < 8, if(i == 4 || i == 6, bv0_r, bv1_r), if(i == 8 || i == 10, if(is_light, 0.48, ch_r * 0.45), if(is_light, 0.94, ch_r * 1.45 + 0.008))))",
+          "g": "if(i < 4, ch_g, if(i < 8, if(i == 4 || i == 6, bv0_g, bv1_g), if(i == 8 || i == 10, if(is_light, 0.48, ch_g * 0.45 + s1 * 0.05), if(is_light, 0.94, ch_g * 1.45 + 0.008 + s1 * 0.09))))",
+          "b": "if(i < 4, ch_b, if(i < 8, if(i == 4 || i == 6, bv0_b, bv1_b), if(i == 8 || i == 10, if(is_light, 0.48, ch_b * 0.45), if(is_light, 0.94, ch_b * 1.45 + 0.010))))",
+          "a": 1
+        }
+      }
+    },
+    {
+      "type": "instanced",
+      "shape": "rect",
+      "blend": "alpha",
+      "count": 684,
+      "visible": "settings.showGrid",
+      "element": {
+        "x": "-0.835 + (i % 38) * (1.67 / 37)",
+        "y": "-0.755 + floor(i / 38) * (1.51 / 17)",
+        "w": "0.020 / aspect",
+        "h": 0.020,
+        "color": {
+          "model": "rgba",
+          "r": "dt_r",
+          "g": "dt_g",
+          "b": "dt_b",
+          "a": "if(settings.housing, 1, 0.72)"
+        }
+      }
+    },
+    {
+      "type": "instanced",
+      "shape": "rect",
+      "blend": "alpha",
+      "count": 47,
+      "visible": "settings.housing",
+      "element": {
+        "x": "if(i < 15, -0.795, -0.795 + (i - 15) * (1.60 / 31))",
+        "y": "if(i < 15, -0.715 + (i + 1) * (1.40 / 15), -0.715)",
+        "w": "0.026 / aspect",
+        "h": 0.026,
+        "color": {
+          "model": "rgba",
+          "r": "mix(ax0_r, ax1_r, i % 2)",
+          "g": "mix(ax0_g, ax1_g, i % 2)",
+          "b": "mix(ax0_b, ax1_b, i % 2)",
+          "a": 1
+        }
+      }
+    },
+    {
+      "type": "instanced",
+      "shape": "glow",
+      "blend": "add",
+      "count": "cols * 16",
+      "visible": "!is_light && settings.crtGlow > 0.02",
+      "element": {
+        "x": "x0 + (floor(i / 16) + 0.5) * cell_w",
+        "y": "y0 + ((i % 16) + 0.5) * 0.08375",
+        "w": "bar_w * 2.1",
+        "h": "seg_h * 2.3",
+        "color": {
+          "model": "rgba",
+          "r": "mix(mix(mix(c0_r, c1_r, clamp(clamp(((i % 16) + 0.5) / 16 + is_fire * (1 - clamp(level((floor(i / 16) + 0.5) / cols) * settings.gain, 0, 1)), 0, 1) / 0.35, 0, 1)), c2_r, clamp((clamp(((i % 16) + 0.5) / 16 + is_fire * (1 - clamp(level((floor(i / 16) + 0.5) / cols) * settings.gain, 0, 1)), 0, 1) - 0.35) / (k2 - 0.35), 0, 1)), c3_r, clamp((clamp(((i % 16) + 0.5) / 16 + is_fire * (1 - clamp(level((floor(i / 16) + 0.5) / cols) * settings.gain, 0, 1)), 0, 1) - k2) / (1 - k2), 0, 1))",
+          "g": "mix(mix(mix(c0_g, c1_g, clamp(clamp(((i % 16) + 0.5) / 16 + is_fire * (1 - clamp(level((floor(i / 16) + 0.5) / cols) * settings.gain, 0, 1)), 0, 1) / 0.35, 0, 1)), c2_g, clamp((clamp(((i % 16) + 0.5) / 16 + is_fire * (1 - clamp(level((floor(i / 16) + 0.5) / cols) * settings.gain, 0, 1)), 0, 1) - 0.35) / (k2 - 0.35), 0, 1)), c3_g, clamp((clamp(((i % 16) + 0.5) / 16 + is_fire * (1 - clamp(level((floor(i / 16) + 0.5) / cols) * settings.gain, 0, 1)), 0, 1) - k2) / (1 - k2), 0, 1))",
+          "b": "mix(mix(mix(c0_b, c1_b, clamp(clamp(((i % 16) + 0.5) / 16 + is_fire * (1 - clamp(level((floor(i / 16) + 0.5) / cols) * settings.gain, 0, 1)), 0, 1) / 0.35, 0, 1)), c2_b, clamp((clamp(((i % 16) + 0.5) / 16 + is_fire * (1 - clamp(level((floor(i / 16) + 0.5) / cols) * settings.gain, 0, 1)), 0, 1) - 0.35) / (k2 - 0.35), 0, 1)), c3_b, clamp((clamp(((i % 16) + 0.5) / 16 + is_fire * (1 - clamp(level((floor(i / 16) + 0.5) / cols) * settings.gain, 0, 1)), 0, 1) - k2) / (1 - k2), 0, 1))",
+          "a": "blm_s * settings.crtGlow * clamp((clamp(level((floor(i / 16) + 0.5) / cols) * settings.gain, 0, 1) * 16 - (i % 16)) * 1.6, 0, 1) * if(is_peaks, 1 - smoothstep(0.9, 1.8, clamp(level((floor(i / 16) + 0.5) / cols) * settings.gain, 0, 1) * 16 - (i % 16)), 1)"
+        }
+      }
+    },
+    {
+      "type": "instanced",
+      "shape": "pill",
+      "blend": "alpha",
+      "count": "cols * 16",
+      "element": {
+        "x": "x0 + (floor(i / 16) + 0.5) * cell_w",
+        "y": "y0 + ((i % 16) + 0.5) * 0.08375",
+        "w": "bar_w",
+        "h": "seg_h",
+        "color": {
+          "model": "rgba",
+          "r": "mix(mix(mix(c0_r, c1_r, clamp(clamp(((i % 16) + 0.5) / 16 + is_fire * (1 - clamp(level((floor(i / 16) + 0.5) / cols) * settings.gain, 0, 1)), 0, 1) / 0.35, 0, 1)), c2_r, clamp((clamp(((i % 16) + 0.5) / 16 + is_fire * (1 - clamp(level((floor(i / 16) + 0.5) / cols) * settings.gain, 0, 1)), 0, 1) - 0.35) / (k2 - 0.35), 0, 1)), c3_r, clamp((clamp(((i % 16) + 0.5) / 16 + is_fire * (1 - clamp(level((floor(i / 16) + 0.5) / cols) * settings.gain, 0, 1)), 0, 1) - k2) / (1 - k2), 0, 1))",
+          "g": "mix(mix(mix(c0_g, c1_g, clamp(clamp(((i % 16) + 0.5) / 16 + is_fire * (1 - clamp(level((floor(i / 16) + 0.5) / cols) * settings.gain, 0, 1)), 0, 1) / 0.35, 0, 1)), c2_g, clamp((clamp(((i % 16) + 0.5) / 16 + is_fire * (1 - clamp(level((floor(i / 16) + 0.5) / cols) * settings.gain, 0, 1)), 0, 1) - 0.35) / (k2 - 0.35), 0, 1)), c3_g, clamp((clamp(((i % 16) + 0.5) / 16 + is_fire * (1 - clamp(level((floor(i / 16) + 0.5) / cols) * settings.gain, 0, 1)), 0, 1) - k2) / (1 - k2), 0, 1))",
+          "b": "mix(mix(mix(c0_b, c1_b, clamp(clamp(((i % 16) + 0.5) / 16 + is_fire * (1 - clamp(level((floor(i / 16) + 0.5) / cols) * settings.gain, 0, 1)), 0, 1) / 0.35, 0, 1)), c2_b, clamp((clamp(((i % 16) + 0.5) / 16 + is_fire * (1 - clamp(level((floor(i / 16) + 0.5) / cols) * settings.gain, 0, 1)), 0, 1) - 0.35) / (k2 - 0.35), 0, 1)), c3_b, clamp((clamp(((i % 16) + 0.5) / 16 + is_fire * (1 - clamp(level((floor(i / 16) + 0.5) / cols) * settings.gain, 0, 1)), 0, 1) - k2) / (1 - k2), 0, 1))",
+          "a": "0.96 * clamp((clamp(level((floor(i / 16) + 0.5) / cols) * settings.gain, 0, 1) * 16 - (i % 16)) * 1.6, 0, 1) * if(is_peaks, 1 - smoothstep(0.9, 1.8, clamp(level((floor(i / 16) + 0.5) / cols) * settings.gain, 0, 1) * 16 - (i % 16)), 1)"
+        }
+      }
+    },
+    {
+      "type": "instanced",
+      "shape": "glow",
+      "blend": "add",
+      "count": "cols",
+      "visible": "!is_light && settings.showPeaks && settings.crtGlow > 0.02",
+      "element": {
+        "x": "x0 + (i + 0.5) * cell_w",
+        "y": "y0 + (clamp(floor(clamp(peak((i + 0.5) / cols) * settings.gain, 0, 1) * 16), 0, 15) + 0.5) * 0.08375",
+        "w": "bar_w * 2.2",
+        "h": "seg_h * 2.4",
+        "color": {
+          "model": "rgba",
+          "r": "pk_r",
+          "g": "pk_g",
+          "b": "pk_b",
+          "a": "blm_s * 1.15 * settings.crtGlow * smoothstep(0.025, 0.07, clamp(peak((i + 0.5) / cols) * settings.gain, 0, 1))"
+        }
+      }
+    },
+    {
+      "type": "instanced",
+      "shape": "pill",
+      "blend": "alpha",
+      "count": "cols",
+      "visible": "settings.showPeaks",
+      "element": {
+        "x": "x0 + (i + 0.5) * cell_w",
+        "y": "y0 + (clamp(floor(clamp(peak((i + 0.5) / cols) * settings.gain, 0, 1) * 16), 0, 15) + 0.5) * 0.08375",
+        "w": "bar_w",
+        "h": 0.055,
+        "color": {
+          "model": "rgba",
+          "r": "pk_r",
+          "g": "pk_g",
+          "b": "pk_b",
+          "a": "0.98 * smoothstep(0.025, 0.07, clamp(peak((i + 0.5) / cols) * settings.gain, 0, 1))"
+        }
+      }
+    }
+  ]
+}

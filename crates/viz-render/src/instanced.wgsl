@@ -1,16 +1,19 @@
-// instanced shapes: one vertex shader, three fragment masks (rect/circle/triangle).
+// instanced shapes: one vertex shader, five fragment paths (rect/circle/triangle/pill/glow).
 //
 // Coordinate contract: artifact space maps directly to NDC (x right, y up, -1..1).
 // The unit quad arrives in local space [-0.5, 0.5]^2; we scale by (w,h), rotate by
-// `rot` (radians, CCW), then translate to (x,y). Local coords are forwarded so the
-// fragment stage can mask circle / triangle. Output color is premultiplied so the
-// alpha-over and additive blend states (set on the pipeline) both behave.
+// `rot` (radians, CCW), then translate to (x,y). Local coords and absolute quad size
+// are forwarded so the fragment stage can mask circle / triangle / pill / glow. Output
+// color is premultiplied so the alpha-over and additive blend states (set on the
+// pipeline) both behave.
 
 struct VsOut {
     @builtin(position) clip: vec4<f32>,
     // Local position within the quad, in [-0.5, 0.5]^2.
     @location(0) local: vec2<f32>,
     @location(1) color: vec4<f32>,
+    // Absolute quad size (|w|, |h|) in NDC units for aspect-true SDF masking.
+    @location(2) size: vec2<f32>,
 };
 
 @vertex
@@ -37,6 +40,7 @@ fn vs_main(
     out.clip = vec4<f32>(pos, 0.0, 1.0);
     out.local = quad;
     out.color = color;
+    out.size = abs(size);
     return out;
 }
 
@@ -75,6 +79,52 @@ fn triangle(in: VsOut) -> vec4<f32> {
     return premul(in.color);
 }
 
+fn pill(in: VsOut) -> vec4<f32> {
+    // Aspect-true rounded-box SDF in NDC scale so corner radius stays circular
+    // across elongated segments.
+    let size = max(in.size, vec2<f32>(1e-5));
+    let p = in.local * size;
+    let half_ext = 0.5 * size;
+    let r = min(half_ext.x, half_ext.y) * 0.36;
+    let d = length(max(abs(p) - (half_ext - vec2<f32>(r)), vec2<f32>(0.0))) - r;
+
+    let aa = max(fwidth(d), 0.0005);
+    let cov = 1.0 - smoothstep(-aa, aa, d);
+    if (cov <= 0.001) {
+        discard;
+    }
+
+    // Subtle physical phosphor/bevel shading only for bright emissive colors
+    // (never brightening dark LCD ink or dim unlit ghost segments).
+    let luma = dot(in.color.rgb, vec3<f32>(0.299, 0.587, 0.114));
+    let emissive = smoothstep(0.32, 0.90, luma);
+    let center = clamp(1.0 - length(in.local * vec2<f32>(1.2, 1.5)), 0.0, 1.0);
+    let edge_shade = mix(1.0, 0.88 + 0.16 * center, emissive);
+    let hot_core = emissive * center * center * 0.22;
+    let rgb = clamp(
+        in.color.rgb * edge_shade + vec3<f32>(hot_core),
+        vec3<f32>(0.0),
+        vec3<f32>(1.0),
+    );
+    return premul(vec4<f32>(rgb, in.color.a * cov));
+}
+
+fn glow(in: VsOut) -> vec4<f32> {
+    // Smooth optical bloom falloff across [-0.5, 0.5]^2 fading cleanly to 0
+    // before the quad boundaries (zero hard box edge).
+    let q = abs(in.local);
+    let core_d = length(max(q - vec2<f32>(0.14), vec2<f32>(0.0)));
+    // 1.0 - smoothstep(lo, hi, x) avoids WGSL/MSL UB from low >= high while
+    // remaining algebraically identical to smoothstep(hi, lo, x).
+    let edge_mask = (1.0 - smoothstep(0.12, 0.49, max(q.x, q.y)))
+        * (1.0 - smoothstep(0.16, 0.54, length(q)));
+    let falloff = exp(-14.0 * core_d * core_d) * edge_mask;
+    if (falloff <= 0.001) {
+        discard;
+    }
+    return premul(vec4<f32>(in.color.rgb, in.color.a * falloff));
+}
+
 @fragment
 fn fs_rect(in: VsOut) -> @location(0) vec4<f32> {
     return rect(in);
@@ -88,6 +138,16 @@ fn fs_circle(in: VsOut) -> @location(0) vec4<f32> {
 @fragment
 fn fs_triangle(in: VsOut) -> @location(0) vec4<f32> {
     return triangle(in);
+}
+
+@fragment
+fn fs_pill(in: VsOut) -> @location(0) vec4<f32> {
+    return pill(in);
+}
+
+@fragment
+fn fs_glow(in: VsOut) -> @location(0) vec4<f32> {
+    return glow(in);
 }
 
 // Feedback path: the accumulator (location 0) and the surface (location 1) get the same color.
@@ -111,5 +171,17 @@ fn fs_circle_mrt(in: VsOut) -> FeedbackOut {
 @fragment
 fn fs_triangle_mrt(in: VsOut) -> FeedbackOut {
     let c = triangle(in);
+    return FeedbackOut(c, c);
+}
+
+@fragment
+fn fs_pill_mrt(in: VsOut) -> FeedbackOut {
+    let c = pill(in);
+    return FeedbackOut(c, c);
+}
+
+@fragment
+fn fs_glow_mrt(in: VsOut) -> FeedbackOut {
+    let c = glow(in);
     return FeedbackOut(c, c);
 }

@@ -906,6 +906,8 @@ fn shape_kind(layer: &Layer) -> ShapeKind {
             Shape::Rect => ShapeKind::Rect,
             Shape::Circle => ShapeKind::Circle,
             Shape::Triangle => ShapeKind::Triangle,
+            Shape::Pill => ShapeKind::Pill,
+            Shape::Glow => ShapeKind::Glow,
         },
         _ => ShapeKind::Rect,
     }

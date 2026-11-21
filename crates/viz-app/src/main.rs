@@ -99,6 +99,14 @@ const BUILTIN_ARTIFACTS: &[(&str, &str)] = &[
         "breathing-grid (built-in)",
         include_str!("../../../assets/builtin-artifacts/breathing-grid.artifact.json"),
     ),
+    (
+        "retro-spectrum-bars (built-in)",
+        include_str!("../../../assets/builtin-artifacts/retro-spectrum-bars.artifact.json"),
+    ),
+    (
+        "winamp-spectrum-bars (built-in)",
+        include_str!("../../../assets/builtin-artifacts/winamp-spectrum-bars.artifact.json"),
+    ),
 ];
 
 /// Builds the artifact library from scratch: the embedded built-ins first (so they

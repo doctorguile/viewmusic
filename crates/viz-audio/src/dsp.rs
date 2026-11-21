@@ -55,6 +55,25 @@ const BAND_ATTACK: f32 = 0.35;
 /// Slow release coefficient for band smoothing (falls slowly).
 const BAND_RELEASE: f32 = 0.87;
 
+// --- Shared-AGC dB spectrum & peak-hold constants ---------------------------
+
+/// Shared global AGC peak decay per hop (~3 s half-life at 93.75 hops/s).
+const GLOBAL_AGC_DECAY: f32 = 0.9975;
+/// Dynamic range mapped linearly into 0..1 on the musical dB scale (dB).
+const DB_RANGE: f32 = 42.0;
+/// Fast attack coefficient for `bands_db` smoothing.
+const BAND_DB_ATTACK: f32 = 0.50;
+/// Musical weighted release coefficient for `bands_db` smoothing.
+const BAND_DB_RELEASE: f32 = 0.84;
+/// Threshold below which decaying `bands_db` snaps to exact 0.0 on silence.
+const BAND_DB_SILENCE_SNAP: f32 = 1.0e-5;
+/// Peak-hold duration in hops (~0.38 s at 93.75 hops/s).
+const PEAK_HOLD_HOPS: u16 = 36;
+/// Downward acceleration added to peak-cap drop velocity per hop after hold expires.
+const PEAK_GRAVITY: f32 = 0.0022;
+/// Terminal downward velocity for peak-cap gravity drop (per hop).
+const PEAK_MAX_VEL: f32 = 0.06;
+
 /// EWMA coefficient for the energy aggregate.
 const ENERGY_EWMA: f32 = 0.80;
 /// Scale mapping raw RMS to the 0..1 energy range. 0 dBFS sine has RMS ≈ 0.707;
@@ -140,6 +159,19 @@ fn build_empty_band_interp(
     table
 }
 
+/// Precomputes gentle pink-tilt weights from each band's geometric center
+/// frequency so realistic −3 dB/oct music has balanced visual energy without
+/// flattening quiet highs up to 1.0.
+fn build_band_tilt() -> [f32; BAND_COUNT] {
+    let edges = band_edges();
+    let mut tilt = [1.0f32; BAND_COUNT];
+    for (k, slot) in tilt.iter_mut().enumerate() {
+        let f_center = (edges[k] * edges[k + 1]).sqrt();
+        *slot = ((f_center / 300.0).powf(0.28)).clamp(0.75, 2.6) as f32;
+    }
+    tilt
+}
+
 /// The pure analyzer. Construct once, then drive with [`Analyzer::push_samples`].
 pub struct Analyzer {
     // FFT machinery (all pre-allocated).
@@ -163,6 +195,12 @@ pub struct Analyzer {
     band_interp: [Option<(usize, usize, f32)>; BAND_COUNT], // fallback for 0-bin bands
     band_peak: [f32; BAND_COUNT],                           // AGC running peak per band
     band_smooth: [f32; BAND_COUNT],                         // smoothed output per band
+    band_tilt: [f32; BAND_COUNT],                           // gentle pink-tilt weight per band
+    global_peak: f32,                                       // shared AGC peak across tilted bands
+    band_db_smooth: [f32; BAND_COUNT],                      // smoothed dB-scaled band levels
+    peak_val: [f32; BAND_COUNT],                            // hardware peak-hold value per band
+    peak_hold_hops: [u16; BAND_COUNT],                      // remaining hold hops per band
+    peak_vel: [f32; BAND_COUNT], // current gravity-fall velocity per band
 
     // Aggregate cutoffs in bins.
     low_hi_bin: usize,
@@ -225,6 +263,7 @@ impl Analyzer {
             }
         }
         let band_interp = build_empty_band_interp(&band_count_per);
+        let band_tilt = build_band_tilt();
 
         let bin_hz = SAMPLE_RATE as f64 / FFT_SIZE as f64;
         let low_hi_bin = (LOW_HI_HZ / bin_hz).round() as usize;
@@ -249,6 +288,12 @@ impl Analyzer {
             band_interp,
             band_peak: [AGC_PEAK_FLOOR; BAND_COUNT],
             band_smooth: [0.0; BAND_COUNT],
+            band_tilt,
+            global_peak: AGC_PEAK_FLOOR,
+            band_db_smooth: [0.0; BAND_COUNT],
+            peak_val: [0.0; BAND_COUNT],
+            peak_hold_hops: [0; BAND_COUNT],
+            peak_vel: [0.0; BAND_COUNT],
             low_hi_bin,
             mid_hi_bin,
             energy_ewma: 0.0,
@@ -268,6 +313,11 @@ impl Analyzer {
         self.since_hop = 0;
         self.band_peak = [AGC_PEAK_FLOOR; BAND_COUNT];
         self.band_smooth = [0.0; BAND_COUNT];
+        self.global_peak = AGC_PEAK_FLOOR;
+        self.band_db_smooth = [0.0; BAND_COUNT];
+        self.peak_val = [0.0; BAND_COUNT];
+        self.peak_hold_hops = [0; BAND_COUNT];
+        self.peak_vel = [0.0; BAND_COUNT];
         self.energy_ewma = 0.0;
         self.onset.reset();
         self.beat_pulse = 0.0;
@@ -349,11 +399,21 @@ impl Analyzer {
         // saved during silence) while decaying AGC/band/energy/beat/onset state
         // identically to a zero-spectrum hop.
         if rms_acc == 0.0 {
+            self.global_peak = (self.global_peak * GLOBAL_AGC_DECAY).max(AGC_PEAK_FLOOR);
             for k in 0..BAND_COUNT {
                 self.band_peak[k] = (self.band_peak[k] * AGC_PEAK_DECAY).max(AGC_PEAK_FLOOR);
                 let smoothed = self.band_smooth[k] * BAND_RELEASE;
                 self.band_smooth[k] = smoothed;
                 frame.bands[k] = sanitize(smoothed).clamp(0.0, 1.0);
+
+                let mut smoothed_db = self.band_db_smooth[k] * BAND_DB_RELEASE;
+                if smoothed_db < BAND_DB_SILENCE_SNAP {
+                    smoothed_db = 0.0;
+                }
+                self.band_db_smooth[k] = smoothed_db;
+                let level = sanitize(smoothed_db).clamp(0.0, 1.0);
+                frame.bands_db[k] = level;
+                frame.band_peaks[k] = self.step_band_peak(k, level);
             }
             self.energy_ewma *= ENERGY_EWMA;
             frame.energy = sanitize(self.energy_ewma).clamp(0.0, 1.0);
@@ -407,7 +467,9 @@ impl Analyzer {
         }
 
         // 4–5. Fold contiguous bin ranges into 48 bands → AGC → asymmetric smoothing.
-        for k in 0..BAND_COUNT {
+        let mut tilted_amp = [0.0f32; BAND_COUNT];
+        let mut max_tilted_amp = 0.0f32;
+        for (k, tilted_slot) in tilted_amp.iter_mut().enumerate() {
             let inv = self.inv_band_count[k];
             let raw = if inv > 0.0 {
                 let (lo, hi) = self.band_ranges[k];
@@ -436,6 +498,31 @@ impl Analyzer {
             };
             self.band_smooth[k] = smoothed;
             frame.bands[k] = sanitize(smoothed).clamp(0.0, 1.0);
+
+            let tilted = amp * self.band_tilt[k];
+            *tilted_slot = tilted;
+            max_tilted_amp = max_tilted_amp.max(tilted);
+        }
+
+        // 5b. Shared-AGC musical dB spectrum (`bands_db`) & hardware peak-hold (`band_peaks`).
+        let global_peak = (self.global_peak * GLOBAL_AGC_DECAY)
+            .max(AGC_PEAK_FLOOR)
+            .max(max_tilted_amp);
+        self.global_peak = global_peak;
+        for (k, &tilted) in tilted_amp.iter().enumerate() {
+            let ratio = (tilted / global_peak).max(1.0e-6);
+            let db = 20.0 * ratio.log10();
+            let target_db = ((db + DB_RANGE) / DB_RANGE).clamp(0.0, 1.0);
+            let prev_db = self.band_db_smooth[k];
+            let smoothed_db = if target_db > prev_db {
+                prev_db + (target_db - prev_db) * BAND_DB_ATTACK
+            } else {
+                prev_db * BAND_DB_RELEASE + target_db * (1.0 - BAND_DB_RELEASE)
+            };
+            self.band_db_smooth[k] = smoothed_db;
+            let level = sanitize(smoothed_db).clamp(0.0, 1.0);
+            frame.bands_db[k] = level;
+            frame.band_peaks[k] = self.step_band_peak(k, level);
         }
 
         // 6. Aggregates low/mid/high from contiguous slices of `self.power` (skip DC bin 0).
@@ -485,6 +572,23 @@ impl Analyzer {
             frame,
             beat: beat_ev,
         }
+    }
+
+    /// Advances the hardware peak-hold cap for band `k` given its current
+    /// sanitized `bands_db` level.
+    #[inline]
+    fn step_band_peak(&mut self, k: usize, level: f32) -> f32 {
+        if level >= self.peak_val[k] {
+            self.peak_val[k] = level;
+            self.peak_hold_hops[k] = PEAK_HOLD_HOPS;
+            self.peak_vel[k] = 0.0;
+        } else if self.peak_hold_hops[k] > 0 {
+            self.peak_hold_hops[k] -= 1;
+        } else {
+            self.peak_vel[k] = (self.peak_vel[k] + PEAK_GRAVITY).min(PEAK_MAX_VEL);
+            self.peak_val[k] = (self.peak_val[k] - self.peak_vel[k]).max(level);
+        }
+        sanitize(self.peak_val[k]).clamp(0.0, 1.0)
     }
 }
 
@@ -570,6 +674,36 @@ mod tests {
                 last.bands[k],
                 &last.bands[..16]
             );
+        }
+    }
+
+    #[test]
+    fn reset_clears_db_and_peak_hold_state() {
+        let n = SAMPLE_RATE as usize / 2;
+        let signal: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f64 / SAMPLE_RATE as f64;
+                (0.8 * (std::f64::consts::TAU * 440.0 * t).sin()) as f32
+            })
+            .collect();
+
+        let mut reused = Analyzer::new();
+        reused.push_samples(&signal, |_, _| {});
+        reused.reset();
+
+        let mut fresh = Analyzer::new();
+        let mut reused_frames = Vec::new();
+        let mut fresh_frames = Vec::new();
+        reused.push_samples(&signal, |f, _| reused_frames.push(*f));
+        fresh.push_samples(&signal, |f, _| fresh_frames.push(*f));
+
+        assert_eq!(reused_frames.len(), fresh_frames.len());
+        for (a, b) in reused_frames.iter().zip(fresh_frames.iter()) {
+            for k in 0..BAND_COUNT {
+                assert_eq!(a.bands[k].to_bits(), b.bands[k].to_bits());
+                assert_eq!(a.bands_db[k].to_bits(), b.bands_db[k].to_bits());
+                assert_eq!(a.band_peaks[k].to_bits(), b.band_peaks[k].to_bits());
+            }
         }
     }
 }

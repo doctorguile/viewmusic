@@ -90,6 +90,28 @@ pub fn valid_corpus() -> Vec<(&'static str, Value)> {
             }])),
         ),
         (
+            "instanced layer (pill, contract 1.1)",
+            json!({
+                "contract": "1.1",
+                "meta": { "id": "x", "name": "X" },
+                "scene": [{
+                    "type": "instanced", "shape": "pill", "count": 16,
+                    "element": { "x": 0, "y": 0, "w": "0.1", "h": "0.2", "color": rgba() }
+                }]
+            }),
+        ),
+        (
+            "instanced layer (glow, contract 1.1)",
+            json!({
+                "contract": "1.1",
+                "meta": { "id": "x", "name": "X" },
+                "scene": [{
+                    "type": "instanced", "shape": "glow", "count": 16, "blend": "add",
+                    "element": { "x": 0, "y": 0, "w": "0.2", "h": "0.2", "color": rgba() }
+                }]
+            }),
+        ),
+        (
             "polyline layer (closed omitted)",
             doc_with_scene(json!([{
                 "type": "polyline", "points": 64, "thickness": "2",

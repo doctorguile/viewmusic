@@ -1,13 +1,13 @@
 # 5. Gallery
 
-> The fifteen shipped built-ins, explained — what each one does, what drives it, the
+> The seventeen shipped built-ins, explained — what each one does, what drives it, the
 > techniques worth stealing, and the settings worth turning. Read these like worked
 > examples: every claim here matches the actual file in
 > [`assets/builtin-artifacts/`](../../assets/builtin-artifacts/).
 
 Each entry follows the same schema: **What you see**, **Reacts to**, **Key
 techniques** (each linking the recipe or reference section that teaches it), and
-**Settings worth playing with**. The first five are the originals; the ten after them
+**Settings worth playing with**. The first five are the originals; the twelve after them
 came later and lean harder on the recipes in [chapter 4](./04-recipes.md).
 
 Want to learn a technique? Find a built-in that uses it here, open its file, and read
@@ -383,6 +383,42 @@ and the `headColor` glow.
 
 ---
 
+### Retro Spectrum Bars
+
+`retro-spectrum-bars` —
+[`retro-spectrum-bars.artifact.json`](../../assets/builtin-artifacts/retro-spectrum-bars.artifact.json)
+
+**What you see.** Authentic 1990s hi-fi hardware spectrum analyzers housed in a
+recessed brushed-metal faceplate and smoked glass (or brushed titanium LCD reflector):
+switch between seven vintage decks — Sony MHC-RX90 VFD, Aiwa HS-PX1000 Titanium LCD,
+Pioneer Carrozzeria cockpit VFD, Technics SH-GE70 amber VFD, Aiwa NSX / JVC MX VFD,
+Kenwood GE-7030 studio VFD, and Sansui Rack LED — across four classic display patterns
+(Bars + Peak, Floating Crest, Center Mirror, and Bars Only).
+
+**Reacts to.** `level(u)` (shared-AGC musical dB spectrum with smooth top-segment
+anti-flicker) and `peak(u)` (hardware gravity-drop peak-hold caps), both scaled by
+`settings.gain`. Zero idle motion on silence.
+
+**Key techniques.**
+
+- Contract v1.1 `level(u)` / `peak(u)` musical dB spectrum and peak-hold functions,
+  plus `pill` rounded segments and additive `glow` optical phosphor/LED halation.
+- Model-parameter dispatch hoisted into per-frame `vars` (geometry, 3-zone phosphor/LED
+  palettes, housing glass/bezel colors, and EL backlight tint), keeping per-element
+  formulas compact and fast without scene-level feedback.
+- Hardware-authentic surface details: a `field` bezel with 3D inner chamfer and smoked
+  glass scanlines, parallax cast shadows for the reflective Aiwa LCD, and aspect-true
+  circular 5mm LED diodes with specular cores for the Sansui rack
+  ([true-circles idiom](./04-recipes.md#41-true-circles)).
+- `visible`-gated housing and graticule layers so disabling `housing` leaves clean
+  floating segments for Transparent desktop overlay mode.
+
+**Settings worth playing with.** `model` (7 classic decks), `pattern` (4 display
+modes), `bloom` (phosphor halation / LCD EL backlight), `housing`, `ghostGrid`,
+`peakHold`, and `gain`.
+
+---
+
 ### Spectrum Galaxy
 
 `spectrum-galaxy` —
@@ -438,6 +474,42 @@ smoothed `kick` var on the beat.
 
 **Settings worth playing with.** `stars` (32–1200), `warpSpeed`, `trail` length, and
 the star `tint`.
+
+---
+
+### Winamp Spectrum Bars
+
+`winamp-spectrum-bars` —
+[`winamp-spectrum-bars.artifact.json`](../../assets/builtin-artifacts/winamp-spectrum-bars.artifact.json)
+
+**What you see.** An authentic Winamp 2.x spectrum analyzer faithfully calibrated from
+seven classic `.wsz` skin packs: Winamp Classic (2.91), Green Dimension V2, TopazAmp,
+Mac OS X Aqua, XMMS Turquoise, Zaxon Remake, and Vizor Bronze. Each skin renders its
+own recessed 3D bevel housing, cavity backdrop, dot-matrix grid, alternating L-axis
+pixel ruler, 4-stop linear-calibrated spectrum ramp, CRT phosphor bloom (disabled on
+the light Aqua skin), and hardware peak-hold caps.
+
+**Reacts to.** `level(u)` per column (16-row stacked bar height and Fire-mode heat
+offset) and `peak(u)` per column (hardware peak-hold caps with gravity drop), scaled
+by `settings.gain`. Completely calm on silence.
+
+**Key techniques.**
+
+- Contract v1.1 `level(u)` / `peak(u)` musical dB ballistics and peak hold, `pill`
+  segments, and additive `glow` CRT phosphor halation without scene-level feedback.
+- Skin-parameter dispatch hoisted into per-frame `vars` (linear-calibrated chassis,
+  3D bevel walls, cavity background, dot grid, alternating L-axis ticks, 4-stop bar
+  ramps, and peak colors) so all seven `.wsz` themes share eight compact layers.
+- Crisp 12-rect recessed housing and aspect-true square dot grid / L-axis pixel ruler
+  ([true-circles idiom](./04-recipes.md#41-true-circles)), `visible`-gated by
+  `settings.housing` for clean Transparent desktop overlay mode.
+- Classic Winamp Fire mode (`1 - lv + row_frac`) shifting every bar's color lookup so
+  the top of each bar burns at the skin's hottest top stop.
+
+**Settings worth playing with.** `skin` (7 classic `.wsz` skins — first choice
+setting, so `Cmd+J` / `Cmd+K` cycles skins immediately), `mode` (Classic Bars /
+Segmented CRT / Fire / Peaks Only), `bars` (10–38), `crtGlow`, `housing`, `showGrid`,
+`showPeaks`, and `gain`.
 
 ---
 

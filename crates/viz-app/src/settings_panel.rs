@@ -148,6 +148,34 @@ impl SettingsPanel {
         }
     }
 
+    /// Cycles the first non-empty `Choice` setting (in declaration order) forward
+    /// or backward, wrapping around at either end. Returns the setting's name and
+    /// new scalar index value, or `None` if no non-empty `Choice` setting exists.
+    pub fn cycle_first_choice(&mut self, forward: bool) -> Option<(String, SettingValue)> {
+        for binding in &mut self.bindings {
+            if let Control::Choice { index, options } = &mut binding.control {
+                if options.is_empty() {
+                    continue;
+                }
+                if forward {
+                    *index = (*index + 1) % options.len();
+                } else {
+                    *index = index.checked_sub(1).unwrap_or(options.len() - 1);
+                }
+                return Some((binding.name.clone(), SettingValue::Scalar(*index as f64)));
+            }
+        }
+        None
+    }
+
+    #[cfg(test)]
+    pub(crate) fn choice_index_for_test(&self, name: &str) -> Option<usize> {
+        self.bindings.iter().find_map(|b| match &b.control {
+            Control::Choice { index, .. } if b.name == name => Some(*index),
+            _ => None,
+        })
+    }
+
     /// Draws every control (declaration order) below the dropdown and appends one
     /// [`SettingChange`] per edited control into `out` (which the caller clears and
     /// reuses each frame — no allocation in the steady state). Returns `true` if the
@@ -562,5 +590,116 @@ mod tests {
         let mut panel = SettingsPanel::new();
         panel.rebind(&art, |_| None);
         assert!(panel.is_empty());
+    }
+
+    #[test]
+    fn cycle_first_choice_wraps_forward_and_backward() {
+        let art = load(ALL_KINDS);
+        let mut panel = SettingsPanel::new();
+        panel.rebind(&art, |_| None);
+        // "style" has options ["a", "b", "c"], default "b" (index 1).
+        assert_eq!(panel.choice_index_for_test("style"), Some(1));
+
+        // Forward: 1 -> 2 -> 0 -> 1
+        assert_eq!(
+            panel.cycle_first_choice(true),
+            Some(("style".to_owned(), SettingValue::Scalar(2.0)))
+        );
+        assert_eq!(panel.choice_index_for_test("style"), Some(2));
+        assert_eq!(
+            panel.cycle_first_choice(true),
+            Some(("style".to_owned(), SettingValue::Scalar(0.0)))
+        );
+        assert_eq!(panel.choice_index_for_test("style"), Some(0));
+        assert_eq!(
+            panel.cycle_first_choice(true),
+            Some(("style".to_owned(), SettingValue::Scalar(1.0)))
+        );
+        assert_eq!(panel.choice_index_for_test("style"), Some(1));
+
+        // Backward: 1 -> 0 -> 2 -> 1
+        assert_eq!(
+            panel.cycle_first_choice(false),
+            Some(("style".to_owned(), SettingValue::Scalar(0.0)))
+        );
+        assert_eq!(panel.choice_index_for_test("style"), Some(0));
+        assert_eq!(
+            panel.cycle_first_choice(false),
+            Some(("style".to_owned(), SettingValue::Scalar(2.0)))
+        );
+        assert_eq!(panel.choice_index_for_test("style"), Some(2));
+        assert_eq!(
+            panel.cycle_first_choice(false),
+            Some(("style".to_owned(), SettingValue::Scalar(1.0)))
+        );
+        assert_eq!(panel.choice_index_for_test("style"), Some(1));
+    }
+
+    #[test]
+    fn cycle_first_choice_picks_first_choice_and_leaves_second_untouched() {
+        const TWO_CHOICES: &str = r##"{
+          "contract": "1.0",
+          "meta": { "id": "two-choices", "name": "Two Choices" },
+          "settings": {
+            "speed":  { "type": "number", "label": "Speed", "min": 0, "max": 10, "default": 2 },
+            "glow":   { "type": "toggle", "label": "Glow", "default": true },
+            "tint":   { "type": "color", "label": "Tint", "default": "#ff8000" },
+            "first":  { "type": "choice", "label": "First", "options": ["x", "y"], "default": "x" },
+            "second": { "type": "choice", "label": "Second", "options": ["p", "q", "r"], "default": "q" }
+          },
+          "scene": [
+            { "type": "instanced", "shape": "rect", "count": "1",
+              "element": { "x": "0", "y": "0", "w": "0.1", "h": "0.1",
+                "color": { "model": "rgba", "r": "1", "g": "1", "b": "1" } } }
+          ]
+        }"##;
+        let art = load(TWO_CHOICES);
+        let mut panel = SettingsPanel::new();
+        panel.rebind(&art, |_| None);
+
+        assert_eq!(panel.choice_index_for_test("first"), Some(0));
+        assert_eq!(panel.choice_index_for_test("second"), Some(1));
+
+        assert_eq!(
+            panel.cycle_first_choice(true),
+            Some(("first".to_owned(), SettingValue::Scalar(1.0)))
+        );
+        assert_eq!(panel.choice_index_for_test("first"), Some(1));
+        assert_eq!(panel.choice_index_for_test("second"), Some(1));
+
+        assert_eq!(
+            panel.cycle_first_choice(false),
+            Some(("first".to_owned(), SettingValue::Scalar(0.0)))
+        );
+        assert_eq!(panel.choice_index_for_test("first"), Some(0));
+        assert_eq!(panel.choice_index_for_test("second"), Some(1));
+    }
+
+    #[test]
+    fn cycle_first_choice_returns_none_without_choice_settings() {
+        const NO_CHOICES: &str = r##"{
+          "contract": "1.0",
+          "meta": { "id": "no-choices", "name": "No Choices" },
+          "settings": {
+            "speed": { "type": "number", "label": "Speed", "min": 0, "max": 10, "default": 2 },
+            "glow":  { "type": "toggle", "label": "Glow", "default": true },
+            "tint":  { "type": "color", "label": "Tint", "default": "#ff8000" }
+          },
+          "scene": [
+            { "type": "instanced", "shape": "rect", "count": "1",
+              "element": { "x": "0", "y": "0", "w": "0.1", "h": "0.1",
+                "color": { "model": "rgba", "r": "1", "g": "1", "b": "1" } } }
+          ]
+        }"##;
+        let art = load(NO_CHOICES);
+        let mut panel = SettingsPanel::new();
+        // Empty panel before rebind.
+        assert_eq!(panel.cycle_first_choice(true), None);
+        assert_eq!(panel.cycle_first_choice(false), None);
+
+        // Panel bound to an artifact with no Choice settings.
+        panel.rebind(&art, |_| None);
+        assert_eq!(panel.cycle_first_choice(true), None);
+        assert_eq!(panel.cycle_first_choice(false), None);
     }
 }

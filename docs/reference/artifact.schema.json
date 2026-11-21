@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://viewmusic.local/schemas/artifact-1.0.json",
+  "$id": "https://viewmusic.local/schemas/artifact-1.1.json",
   "title": "ViewMusic Visual Artifact",
-  "description": "Contract v1.0 for ViewMusic visual artifacts. Design-time reference; the canonical published schema is generated from the implementation types via schemars and must stay equivalent (CI round-trip test).",
+  "description": "Contract v1.1 (1.x) for ViewMusic visual artifacts. Design-time reference; the canonical published schema is generated from the implementation types via schemars and must stay equivalent (CI round-trip test).",
   "type": "object",
   "required": ["contract", "meta", "scene"],
   "additionalProperties": false,
@@ -160,7 +160,7 @@
       "additionalProperties": false,
       "properties": {
         "type": { "const": "instanced" },
-        "shape": { "enum": ["rect", "circle", "triangle"] },
+        "shape": { "enum": ["rect", "circle", "triangle", "pill", "glow"] },
         "count": { "$ref": "#/$defs/formula" },
         "blend": { "$ref": "#/$defs/blend" },
         "visible": { "$ref": "#/$defs/formula" },

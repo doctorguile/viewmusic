@@ -131,6 +131,8 @@ on_both_upload_paths!(
     instanced_rect_draws_and_clears_elsewhere,
     instanced_circle_masks_corners,
     instanced_triangle_masks_top_corners,
+    instanced_pill_draws_center_and_masks_corners,
+    instanced_glow_falls_off_to_edge_and_brightens_with_add,
     additive_blend_brightens_overlap,
     polyline_draws_a_visible_line,
     field_fills_cells_with_color,
@@ -363,6 +365,133 @@ fn instanced_triangle_masks_top_corners(device: &wgpu::Device, queue: &wgpu::Que
     assert!(
         is_clearish(top_left),
         "triangle top-left corner should be masked, got {top_left:?}"
+    );
+}
+
+fn instanced_pill_draws_center_and_masks_corners(device: &wgpu::Device, queue: &wgpu::Queue) {
+    let mut renderer = Renderer::new(device, queue, FORMAT);
+    renderer.resize(device, W, H);
+
+    // Wide pill spanning x in [-0.6, 0.6], y in [-0.3, 0.3].
+    let inst = [InstanceData {
+        x: 0.0,
+        y: 0.0,
+        w: 1.2,
+        h: 0.6,
+        rot: 0.0,
+        color: [0.2, 0.9, 1.0, 1.0],
+    }];
+    let layers = [LayerDraw::Instanced {
+        shape: ShapeKind::Pill,
+        blend: BlendMode::Alpha,
+        instances: &inst,
+    }];
+    let rb = render_scene(
+        device,
+        queue,
+        &mut renderer,
+        &SceneParams::default(),
+        &layers,
+    );
+
+    let center = rb.at_ndc(0.0, 0.0);
+    assert!(
+        center[1] > 200 && center[2] > 200,
+        "pill center should be bright, got {center:?}"
+    );
+    let side = rb.at_ndc(0.56, 0.0);
+    assert!(
+        !is_clearish(side),
+        "pill straight side interior should be drawn, got {side:?}"
+    );
+    // Strictly inside the 1.2×0.6 quad, outside the rounded corner radius.
+    let corner = rb.at_ndc(0.59, 0.29);
+    assert!(
+        is_clearish(corner),
+        "pill quad corner should be masked to clear, got {corner:?}"
+    );
+}
+
+fn instanced_glow_falls_off_to_edge_and_brightens_with_add(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) {
+    let mut renderer = Renderer::new(device, queue, FORMAT);
+    renderer.resize(device, W, H);
+
+    // Glow quad spanning [-0.6, 0.6]^2 with half-bright red so additive overlap does not saturate early.
+    let one = [InstanceData {
+        x: 0.0,
+        y: 0.0,
+        w: 1.2,
+        h: 1.2,
+        rot: 0.0,
+        color: [0.5, 0.0, 0.0, 1.0],
+    }];
+    let rb_alpha = render_scene(
+        device,
+        queue,
+        &mut renderer,
+        &SceneParams::default(),
+        &[LayerDraw::Instanced {
+            shape: ShapeKind::Glow,
+            blend: BlendMode::Alpha,
+            instances: &one,
+        }],
+    );
+
+    let center = rb_alpha.at_ndc(0.0, 0.0);
+    let mid = rb_alpha.at_ndc(0.30, 0.0);
+    let edge = rb_alpha.at_ndc(0.59, 0.0);
+    let corner = rb_alpha.at_ndc(0.59, 0.59);
+
+    assert!(
+        center[0] > 100 && !is_clearish(center),
+        "glow center should be bright, got {center:?}"
+    );
+    assert!(
+        mid[0] > 30 && mid[0] + 20 < center[0],
+        "glow mid-falloff should be softer than center and above clear: center={center:?}, mid={mid:?}"
+    );
+    assert!(
+        is_clearish(edge),
+        "glow quad edge should fade to clear, got {edge:?}"
+    );
+    assert!(
+        is_clearish(corner),
+        "glow quad corner should fade to clear, got {corner:?}"
+    );
+
+    // Additive blend: two overlapping glows brighten the center over one.
+    let two = [one[0], one[0]];
+    let rb_add_one = render_scene(
+        device,
+        queue,
+        &mut renderer,
+        &SceneParams::default(),
+        &[LayerDraw::Instanced {
+            shape: ShapeKind::Glow,
+            blend: BlendMode::Add,
+            instances: &one,
+        }],
+    );
+    let rb_add_two = render_scene(
+        device,
+        queue,
+        &mut renderer,
+        &SceneParams::default(),
+        &[LayerDraw::Instanced {
+            shape: ShapeKind::Glow,
+            blend: BlendMode::Add,
+            instances: &two,
+        }],
+    );
+
+    let r1 = rb_add_one.at_ndc(0.0, 0.0)[0];
+    let r2 = rb_add_two.at_ndc(0.0, 0.0)[0];
+    assert!(
+        r2 > r1 + 40,
+        "additive glow overlap must brighten center: one={r1}, two={r2}"
     );
 }
 

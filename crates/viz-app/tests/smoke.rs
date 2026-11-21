@@ -24,9 +24,9 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use viz_app::runtime::ArtifactRuntime;
-use viz_contract::{load_artifact, LoadedArtifact};
+use viz_contract::{load_artifact, LayerPrograms, LoadedArtifact};
 use viz_core::{FeatureFrame, BAND_COUNT, WAVEFORM_LEN};
-use viz_render::{LayerDraw, MAX_FIELD_CELLS, MAX_INSTANCES, MAX_POINTS};
+use viz_render::{LayerDraw, ShapeKind, MAX_FIELD_CELLS, MAX_INSTANCES, MAX_POINTS};
 
 /// Absolute path to the shipped built-in artifacts directory.
 fn builtins_dir() -> PathBuf {
@@ -289,4 +289,201 @@ fn reload(dir: &std::path::Path, name: &str) -> LoadedArtifact {
     let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("reading {name}: {e}"));
     load_artifact(name, &bytes)
         .unwrap_or_else(|diag| panic!("built-in {name} failed to load: {diag}"))
+}
+
+/// Exercises all seven hardware models, all four display patterns, transparent
+/// housing-off mode, calm silence behavior, and op-count margins on
+/// `retro-spectrum-bars.artifact.json`.
+#[test]
+fn retro_spectrum_bars_models_patterns_and_invariants() {
+    let loaded = reload(&builtins_dir(), "retro-spectrum-bars.artifact.json");
+    assert_eq!(loaded.artifact.contract, "1.1");
+    assert!(loaded.artifact.feedback.is_none());
+    assert!(loaded.artifact.scene.len() <= 16);
+
+    // Check per-formula and total op counts stay comfortably inside caps.
+    let mut max_formula_ops = 0usize;
+    let mut total_ops = 0usize;
+    let mut visit = |f: &viz_contract::CompiledFormula| {
+        let ops = f.op_count();
+        max_formula_ops = max_formula_ops.max(ops);
+        total_ops += ops;
+    };
+    for f in &loaded.programs.vars_init {
+        visit(f);
+    }
+    for f in &loaded.programs.vars_frame {
+        visit(f);
+    }
+    for layer in &loaded.programs.layers {
+        match layer {
+            LayerPrograms::Instanced {
+                count,
+                visible,
+                x,
+                y,
+                w,
+                h,
+                rot,
+                color,
+            } => {
+                visit(count);
+                if let Some(v) = visible {
+                    visit(v);
+                }
+                for f in [x, y, w, h, &color.c0, &color.c1, &color.c2] {
+                    visit(f);
+                }
+                if let Some(a) = &color.a {
+                    visit(a);
+                }
+                if let Some(r) = rot {
+                    visit(r);
+                }
+            }
+            LayerPrograms::Polyline {
+                points,
+                thickness,
+                visible,
+                x,
+                y,
+                color,
+                ..
+            } => {
+                visit(points);
+                visit(thickness);
+                if let Some(v) = visible {
+                    visit(v);
+                }
+                for f in [x, y, &color.c0, &color.c1, &color.c2] {
+                    visit(f);
+                }
+                if let Some(a) = &color.a {
+                    visit(a);
+                }
+            }
+            LayerPrograms::Field {
+                resolution,
+                visible,
+                color,
+            } => {
+                visit(resolution);
+                if let Some(v) = visible {
+                    visit(v);
+                }
+                for f in [&color.c0, &color.c1, &color.c2] {
+                    visit(f);
+                }
+                if let Some(a) = &color.a {
+                    visit(a);
+                }
+            }
+        }
+    }
+    println!(
+        "retro-spectrum-bars: layers={}, vars={}, max_formula_ops={max_formula_ops}/256, total_ops={total_ops}/16384",
+        loaded.artifact.scene.len(),
+        loaded.artifact.vars.len()
+    );
+    assert!(
+        max_formula_ops <= 256 && total_ops <= 16_384,
+        "op counts exceeded limits: max_formula_ops={max_formula_ops}, total_ops={total_ops}"
+    );
+
+    let mut loud = loud_frame();
+    for k in 0..BAND_COUNT {
+        let lv = (0.25 + 0.7 * (k as f32 * 0.17).sin().abs()).clamp(0.0, 1.0);
+        loud.bands_db[k] = lv;
+        loud.band_peaks[k] = (lv + 0.12).min(1.0);
+    }
+    let silent = FeatureFrame::default();
+    let aspect = 16.0_f32 / 9.0_f32;
+
+    let mut rt = ArtifactRuntime::new(loaded);
+    rt.activate();
+
+    // Every model (0..=6) x every pattern (0..=3) renders cleanly on loud + silence.
+    for model in 0..=6 {
+        assert!(rt.set_setting_scalar("model", model as f64));
+        for pattern in 0..=3 {
+            assert!(rt.set_setting_scalar("pattern", pattern as f64));
+            assert_scene_ok(&mut rt, &loud, &format!("retro/m{model}/p{pattern}/loud"));
+            assert_scene_ok(
+                &mut rt,
+                &silent,
+                &format!("retro/m{model}/p{pattern}/silent"),
+            );
+
+            // Sansui Rack LED (model 6) must emit aspect-true circles.
+            if model == 6 {
+                let scene = rt.frame(&loud, 1.0 / 60.0, aspect, 1.0);
+                let mut saw_circle = false;
+                for layer in &scene.layers {
+                    if let LayerDraw::Instanced {
+                        shape: ShapeKind::Circle,
+                        instances,
+                        ..
+                    } = layer
+                    {
+                        saw_circle = true;
+                        for inst in *instances {
+                            assert!(
+                                (inst.w * aspect - inst.h).abs() < 1e-4,
+                                "LED circle not aspect-true: w={} h={} aspect={aspect}",
+                                inst.w,
+                                inst.h
+                            );
+                        }
+                    }
+                }
+                assert!(
+                    saw_circle,
+                    "Sansui Rack LED must emit circular diode layers"
+                );
+            }
+
+            // Aiwa HS-PX1000 LCD (model 1) must not emit optical Glow layers.
+            if model == 1 {
+                let scene = rt.frame(&loud, 1.0 / 60.0, aspect, 1.0);
+                for layer in &scene.layers {
+                    assert!(
+                        !matches!(
+                            layer,
+                            LayerDraw::Instanced {
+                                shape: ShapeKind::Glow,
+                                ..
+                            }
+                        ),
+                        "Aiwa LCD must not emit Glow layers"
+                    );
+                }
+            }
+        }
+    }
+
+    // Transparent mode (housing = false) skips housing field; with ghostGrid = false
+    // and silence, every lit segment/peak has alpha == 0 (calm on silence).
+    assert!(rt.set_setting_scalar("housing", 0.0));
+    assert!(rt.set_setting_scalar("ghostGrid", 0.0));
+    for model in 0..=6 {
+        assert!(rt.set_setting_scalar("model", model as f64));
+        for pattern in 0..=3 {
+            assert!(rt.set_setting_scalar("pattern", pattern as f64));
+            let scene = rt.frame(&silent, 1.0 / 60.0, aspect, 1.0);
+            for layer in &scene.layers {
+                assert!(
+                    !matches!(layer, LayerDraw::Field { .. }),
+                    "housing=false must hide housing field"
+                );
+                if let LayerDraw::Instanced { instances, .. } = layer {
+                    for inst in *instances {
+                        assert_eq!(
+                            inst.color[3], 0.0,
+                            "model {model} pattern {pattern} leaked non-zero alpha on silence"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }

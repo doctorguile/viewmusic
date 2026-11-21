@@ -45,6 +45,8 @@ const FUNCS: &[(&str, usize)] = &[
     ("step", 2),
     ("if", 3),
     ("band", 1),
+    ("level", 1),
+    ("peak", 1),
     ("wave", 1),
     ("rand", 1),
 ];
@@ -104,6 +106,12 @@ fn make_frame() -> FeatureFrame {
     let mut f = FeatureFrame::default();
     for (k, b) in f.bands.iter_mut().enumerate() {
         *b = (k as f32 / 47.0).sin().abs();
+    }
+    for (k, b) in f.bands_db.iter_mut().enumerate() {
+        *b = (k as f32 / 47.0 * 1.5).cos().abs();
+    }
+    for (k, p) in f.band_peaks.iter_mut().enumerate() {
+        *p = ((k as f32 / 47.0 * 1.5).cos().abs() + 0.1).min(1.0);
     }
     for (k, w) in f.waveform.iter_mut().enumerate() {
         *w = (k as f32 / 255.0 * std::f32::consts::TAU).sin();
@@ -289,6 +297,7 @@ fn batch_matches_per_item_on_index_formulas() {
         "sin(x * 3 + t) * cos(y * 3 - t) + (i % 7) / 7",
         "abs(sin(x * y * 3 + t)) * smoothstep(0.1, 0.9, u) + rand(i)",
         "if(i % 2 == 0, band(u), wave(fract(i * 0.37)))",
+        "level(u) + peak(u) * 0.5",
     ];
     let inputs: Vec<MultiInput> = srcs.iter().map(|s| MultiInput::Expr(s)).collect();
     let shared_vals = [1.25, 0.5, 0.3, 2.0, 0.0, 0.0, 4096.0, 0.0, 0.3];

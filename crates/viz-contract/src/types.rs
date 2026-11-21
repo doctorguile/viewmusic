@@ -1,5 +1,5 @@
 //! Typed artifact model — the in-memory mirror of the published contract
-//! (`docs/reference/artifact.schema.json`, contract v1.0).
+//! (`docs/reference/artifact.schema.json`, contract v1.1).
 //!
 //! These types deserialize one `.artifact.json` file and, via the
 //! `schemars` `JsonSchema` derive, regenerate a schema that must stay semantically
@@ -58,10 +58,10 @@ pub mod limits {
     ///
     /// Semantics enforced by the validation pass (not by serde): names must be unique
     /// and must not shadow any built-in identifier reserved in contract §2.3
-    /// (`t`, `dt`, `energy`, `low`, `mid`, `high`, `beat`, `beat_count`, `band`, `wave`,
-    /// `aspect`, `i`, `n`, `u`, `x`, `y`, `pi`, `tau`, `e`, the `settings`/`rand` namespaces,
-    /// and any declared var name). `meta.id` uses the stricter `[a-z][a-z0-9-]*` rule and is
-    /// validated via [`viz_core::ArtifactId`].
+    /// (`t`, `dt`, `energy`, `low`, `mid`, `high`, `beat`, `beat_count`, `band`, `level`,
+    /// `peak`, `wave`, `aspect`, `i`, `n`, `u`, `x`, `y`, `pi`, `tau`, `e`, the
+    /// `settings`/`rand` namespaces, and any declared var name). `meta.id` uses the
+    /// stricter `[a-z][a-z0-9-]*` rule and is validated via [`viz_core::ArtifactId`].
     pub const SETTING_NAME_RE: &str = r"^[a-z][a-zA-Z0-9_]*$";
 }
 
@@ -232,6 +232,10 @@ pub enum Shape {
     Circle,
     /// Triangle.
     Triangle,
+    /// Aspect-true anti-aliased rounded pill / stadium segment (contract v1.1).
+    Pill,
+    /// Smooth radial optical glow / halation quad (contract v1.1).
+    Glow,
 }
 
 /// One drawn layer (contract §6). Tagged on `type`.

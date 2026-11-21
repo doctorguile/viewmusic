@@ -23,7 +23,7 @@
 //! allocation, no lock, and no blocking I/O in [`Renderer::render`].
 //!
 //! ## Module map
-//! - [`instanced`]: instanced quads with rect/circle/triangle masking, two blends.
+//! - [`instanced`]: instanced quads with rect/circle/triangle/pill/glow masking, two blends.
 //! - [`polyline`]: thick polylines as instanced screen-space segment quads.
 //! - [`field`]: resolution×resolution color grid as instanced cell quads.
 //! - [`feedback`]: persistent decay/trails accumulator (rendered alongside the surface).
@@ -192,7 +192,8 @@ impl PassTargets {
 
 /// Which primitive an [`LayerDraw::Instanced`] layer rasterizes.
 ///
-/// Selects a fragment mask (circle radius / triangle half-plane); see [`instanced`].
+/// Selects a fragment shader mask/shading path (rect, circle, triangle, pill, glow);
+/// see [`instanced`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ShapeKind {
     /// Axis-then-rotated rectangle filling the full `w×h` quad.
@@ -201,16 +202,25 @@ pub enum ShapeKind {
     Circle,
     /// Upward isoceles triangle inscribed in the quad (half-plane mask).
     Triangle,
+    /// Aspect-true anti-aliased rounded phosphor/LCD segment pill with subtle emissive
+    /// core shading.
+    Pill,
+    /// Smooth exponential optical bloom/halation quad fading cleanly to 0 before quad
+    /// boundaries.
+    Glow,
 }
 
 impl ShapeKind {
-    /// Index into the three-element pipeline table (`0 = Rect`, `1 = Circle`, `2 = Tri`).
+    /// Index into the five-element pipeline table (`0 = Rect`, `1 = Circle`,
+    /// `2 = Triangle`, `3 = Pill`, `4 = Glow`).
     #[inline]
     fn index(self) -> usize {
         match self {
             ShapeKind::Rect => 0,
             ShapeKind::Circle => 1,
             ShapeKind::Triangle => 2,
+            ShapeKind::Pill => 3,
+            ShapeKind::Glow => 4,
         }
     }
 }

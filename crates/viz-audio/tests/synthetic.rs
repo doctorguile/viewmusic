@@ -346,6 +346,16 @@ fn deterministic_frame_sequences() {
                 y.bands[k].to_bits(),
                 "band {k} differs"
             );
+            assert_eq!(
+                x.bands_db[k].to_bits(),
+                y.bands_db[k].to_bits(),
+                "bands_db {k} differs"
+            );
+            assert_eq!(
+                x.band_peaks[k].to_bits(),
+                y.band_peaks[k].to_bits(),
+                "band_peaks {k} differs"
+            );
         }
         for k in 0..x.waveform.len() {
             assert_eq!(x.waveform[k].to_bits(), y.waveform[k].to_bits());
@@ -362,4 +372,172 @@ fn deterministic_frame_sequences() {
 #[test]
 fn spectrum_dimensions() {
     assert_eq!(SPECTRUM_BINS, 513);
+}
+
+// (f) Shared-AGC `bands_db` preserves tonal contrast:
+//     - A pure 440 Hz tone peaks around 440 Hz while far quiet bands stay near 0.
+//     - A second tone 24 dB quieter reads clearly lower than the dominant 440 Hz band.
+#[test]
+fn bands_db_preserves_tonal_contrast() {
+    // Part 1: pure 440 Hz tone.
+    let mut a = Analyzer::new();
+    let sig_440 = sine(440.0, 0.8, SAMPLE_RATE as usize);
+    let (frames, _) = run(&mut a, &sig_440);
+    let last = frames.last().unwrap();
+
+    let b440 = expected_band(440.0);
+    let peak_band = argmax_band(&last.bands_db);
+    assert!(
+        peak_band.abs_diff(b440) <= 1,
+        "440 Hz bands_db peak at band {peak_band}, expected {b440} (±1); bands_db={:?}",
+        &last.bands_db[..]
+    );
+    assert!(
+        last.bands_db[peak_band] > 0.9,
+        "dominant 440 Hz band should be near 1.0, got {}",
+        last.bands_db[peak_band]
+    );
+    let far_low = 2;
+    let far_high = (b440 + 12).min(BAND_COUNT - 1);
+    assert!(
+        last.bands_db[far_low] < 0.05 && last.bands_db[far_high] < 0.05,
+        "far quiet bands should stay near 0: low={} high={}",
+        last.bands_db[far_low],
+        last.bands_db[far_high]
+    );
+
+    // Part 2: 440 Hz dominant tone + 1500 Hz tone 24 dB quieter (-24 dB ≈ 0.0631×).
+    let mut a2 = Analyzer::new();
+    let n = SAMPLE_RATE as usize;
+    let quiet_amp = 0.8 * 10.0_f32.powf(-24.0 / 20.0);
+    let sig_dom = sine(440.0, 0.8, n);
+    let sig_quiet = sine(1500.0, quiet_amp, n);
+    let mixed: Vec<f32> = sig_dom
+        .iter()
+        .zip(sig_quiet.iter())
+        .map(|(&x, &y)| x + y)
+        .collect();
+    let (frames2, _) = run(&mut a2, &mixed);
+    let last2 = frames2.last().unwrap();
+
+    let b1500 = expected_band(1500.0);
+    let dom_val = (b440.saturating_sub(1)..=(b440 + 1).min(BAND_COUNT - 1))
+        .map(|k| last2.bands_db[k])
+        .fold(0.0_f32, f32::max);
+    let quiet_val = (b1500.saturating_sub(1)..=(b1500 + 1).min(BAND_COUNT - 1))
+        .map(|k| last2.bands_db[k])
+        .fold(0.0_f32, f32::max);
+    let unexcited = BAND_COUNT - 3;
+
+    assert!(
+        dom_val > 0.9,
+        "dominant 440 Hz band should be near 1.0, got {dom_val}"
+    );
+    assert!(
+        quiet_val > 0.10 && quiet_val < dom_val - 0.30,
+        "-24 dB quieter band ({quiet_val}) should be audible yet clearly lower than dominant ({dom_val})"
+    );
+    assert!(
+        last2.bands_db[unexcited] < 0.05,
+        "unexcited far high band should stay near 0, got {}",
+        last2.bands_db[unexcited]
+    );
+}
+
+// (g) Hardware peak-hold `band_peaks`:
+//     snaps up on a burst, holds steady across the 36-hop (~0.38 s) hold window,
+//     falls with accelerating gravity drop, and settles to exact 0.0 on sustained silence.
+#[test]
+fn band_peaks_hold_gravity_and_silence_settle() {
+    let mut a = Analyzer::new();
+    // 100 ms burst at 440 Hz followed by 2.0 s of exact silence.
+    let burst_len = SAMPLE_RATE as usize / 10;
+    let silence_len = SAMPLE_RATE as usize * 2;
+    let mut sig = sine(440.0, 0.8, burst_len);
+    sig.resize(burst_len + silence_len, 0.0);
+
+    let (frames, _) = run(&mut a, &sig);
+    assert!(!frames.is_empty());
+
+    // Peak-hold cap must never sit below its corresponding bands_db level.
+    for (idx, f) in frames.iter().enumerate() {
+        for k in 0..BAND_COUNT {
+            assert!(
+                f.band_peaks[k] + 1e-6 >= f.bands_db[k],
+                "frame {idx} band {k}: peak {} < bands_db {}",
+                f.band_peaks[k],
+                f.bands_db[k]
+            );
+        }
+    }
+
+    // Locate the dominant band during the burst.
+    let b440 = expected_band(440.0);
+    let mut target_band = b440;
+    let mut peak_max = 0.0_f32;
+    for f in &frames {
+        for k in b440.saturating_sub(1)..=(b440 + 1).min(BAND_COUNT - 1) {
+            if f.band_peaks[k] > peak_max {
+                peak_max = f.band_peaks[k];
+                target_band = k;
+            }
+        }
+    }
+    assert!(
+        peak_max > 0.8,
+        "burst should snap peak cap high (>0.8), got {peak_max}"
+    );
+
+    // Find the last frame where bands_db refreshed the peak (hold timer starts here).
+    let hold_start = frames
+        .iter()
+        .rposition(|f| (f.bands_db[target_band] - peak_max).abs() < 1e-6)
+        .expect("bands_db must reach peak_max at burst crest");
+
+    // Peak must hold steady for the full 36-hop (~0.38 s) hold window while bands_db decays.
+    const HOLD_HOPS: usize = 36;
+    assert!(
+        hold_start + HOLD_HOPS + 4 < frames.len(),
+        "not enough trailing frames after burst"
+    );
+    for step in 1..=HOLD_HOPS {
+        let p = frames[hold_start + step].band_peaks[target_band];
+        assert_eq!(
+            p.to_bits(),
+            peak_max.to_bits(),
+            "peak should hold steady at hop +{step} (expected {peak_max}, got {p})"
+        );
+    }
+    assert!(
+        frames[hold_start + HOLD_HOPS].bands_db[target_band] < peak_max * 0.25,
+        "bands_db should have decayed well below held peak by end of hold window"
+    );
+
+    // After the hold window expires, successive per-hop drops must accelerate.
+    let p0 = frames[hold_start + HOLD_HOPS].band_peaks[target_band];
+    let p1 = frames[hold_start + HOLD_HOPS + 1].band_peaks[target_band];
+    let p2 = frames[hold_start + HOLD_HOPS + 2].band_peaks[target_band];
+    let p3 = frames[hold_start + HOLD_HOPS + 3].band_peaks[target_band];
+    let d1 = p0 - p1;
+    let d2 = p1 - p2;
+    let d3 = p2 - p3;
+    assert!(
+        d1 > 0.0 && d2 > d1 && d3 > d2,
+        "peak drop after hold should accelerate: d1={d1} d2={d2} d3={d3}"
+    );
+
+    // During sustained silence, both bands_db and band_peaks settle to exact 0.0.
+    let last = frames.last().unwrap();
+    for k in 0..BAND_COUNT {
+        assert_eq!(
+            last.bands_db[k], 0.0,
+            "sustained silence bands_db[{k}] should settle to exact 0.0, got {}",
+            last.bands_db[k]
+        );
+        assert_eq!(
+            last.band_peaks[k], 0.0,
+            "sustained silence band_peaks[{k}] should settle to exact 0.0, got {}",
+            last.band_peaks[k]
+        );
+    }
 }

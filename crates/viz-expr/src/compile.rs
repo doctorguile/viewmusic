@@ -519,6 +519,8 @@ fn builtin_to_op(b: BuiltinOp) -> Op {
         BuiltinOp::Step => Op::Step,
         BuiltinOp::If => Op::If,
         BuiltinOp::Band => Op::Band,
+        BuiltinOp::Level => Op::Level,
+        BuiltinOp::Peak => Op::Peak,
         BuiltinOp::Wave => Op::Wave,
         BuiltinOp::Rand => Op::Rand,
     }

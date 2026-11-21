@@ -120,6 +120,14 @@ mod harness {
             "breathing-grid (built-in)",
             include_str!("../../../assets/builtin-artifacts/breathing-grid.artifact.json"),
         ),
+        (
+            "retro-spectrum-bars (built-in)",
+            include_str!("../../../assets/builtin-artifacts/retro-spectrum-bars.artifact.json"),
+        ),
+        (
+            "winamp-spectrum-bars (built-in)",
+            include_str!("../../../assets/builtin-artifacts/winamp-spectrum-bars.artifact.json"),
+        ),
     ];
 
     /// The format `GpuContext::new` (window.rs) ends up with on macOS: the surface's

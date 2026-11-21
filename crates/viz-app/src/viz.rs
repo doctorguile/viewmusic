@@ -289,7 +289,7 @@ pub struct VizApp {
     on_window_mode_change: Option<WindowModeChangeHook>,
     /// Current live window mode flags (borderless, transparent, always-on-top).
     window_mode: WindowMode,
-    /// Latest keyboard modifier state (drives `Cmd+1..5`, `Cmd+W`, `Cmd+T`, `Cmd+Y`, `Cmd+U` shortcuts).
+    /// Latest keyboard modifier state (drives `Cmd+1..5`, `Cmd+W`, `Cmd+T`, `Cmd+Y`, `Cmd+U`, `Cmd+J`, `Cmd+K` shortcuts).
     modifiers: ModifiersState,
     /// Whether the most recently rendered view was [`AppView::Active`], used to keep
     /// non-Active guidance screens opaque even when transparent mode is enabled.
@@ -772,6 +772,24 @@ impl VizApp {
         }
     }
 
+    /// Cycles the active artifact's first `Choice` setting forward or backward,
+    /// applying the updated value to the runtime and invoking persistence hooks.
+    /// Returns `true` when a `Choice` setting was updated, or `false` when the
+    /// active artifact has no `Choice` setting (or no artifact is active).
+    fn cycle_first_choice(&mut self, direction: CycleDirection) -> bool {
+        let next = self
+            .model
+            .borrow_mut()
+            .settings
+            .cycle_first_choice(direction == CycleDirection::Next);
+        if let Some((name, value)) = next {
+            self.apply_setting_request(false, &[SettingEdit { name, value }]);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Opens the macOS Screen & System Audio Recording privacy pane directly via
     /// `open(1)` — shelling out keeps this dependency-free (no extra crate just to
     /// launch a URL). Logs once on success and on failure; a spawn failure does not
@@ -931,7 +949,7 @@ fn non_permission_capture_failure(
     }
 }
 
-/// Direction to step when cycling through loaded visualizer artifacts.
+/// Direction to step when cycling through loaded visualizer artifacts or choice options.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CycleDirection {
     Next,
@@ -950,6 +968,9 @@ enum WindowShortcut {
     /// Cycle to the next or previous loaded visualizer artifact (`Cmd+Y`/`Cmd+U` on
     /// macOS, `Ctrl+Y`/`Ctrl+U` elsewhere).
     CycleArtifact(CycleDirection),
+    /// Cycle the active artifact's first `Choice` setting (`Cmd+J` next / `Cmd+K` prev
+    /// on macOS, `Ctrl+J` / `Ctrl+K` elsewhere).
+    CycleFirstChoice(CycleDirection),
 }
 
 /// Returns the next or previous artifact id in `entries` relative to `active`,
@@ -1022,6 +1043,12 @@ fn match_window_shortcut(
         PhysicalKey::Code(KeyCode::KeyU) => {
             return Some(WindowShortcut::CycleArtifact(CycleDirection::Prev));
         }
+        PhysicalKey::Code(KeyCode::KeyJ) => {
+            return Some(WindowShortcut::CycleFirstChoice(CycleDirection::Next));
+        }
+        PhysicalKey::Code(KeyCode::KeyK) => {
+            return Some(WindowShortcut::CycleFirstChoice(CycleDirection::Prev));
+        }
         _ => {}
     }
 
@@ -1039,13 +1066,19 @@ fn match_window_shortcut(
         Key::Character("u") | Key::Character("U") => {
             Some(WindowShortcut::CycleArtifact(CycleDirection::Prev))
         }
+        Key::Character("j") | Key::Character("J") => {
+            Some(WindowShortcut::CycleFirstChoice(CycleDirection::Next))
+        }
+        Key::Character("k") | Key::Character("K") => {
+            Some(WindowShortcut::CycleFirstChoice(CycleDirection::Prev))
+        }
         _ => None,
     }
 }
 
 impl RenderCallback for VizApp {
     fn on_window_event(&mut self, window: &Window, event: &WindowEvent) -> bool {
-        // Track keyboard modifiers for window shortcuts (`Cmd+1..5`, `Cmd+W`, `Cmd+T`, `Cmd+Y`, `Cmd+U`).
+        // Track keyboard modifiers for window shortcuts (`Cmd+1..5`, `Cmd+W`, `Cmd+T`, `Cmd+Y`, `Cmd+U`, `Cmd+J`, `Cmd+K`).
         match event {
             WindowEvent::ModifiersChanged(mods) => {
                 self.modifiers = mods.state();
@@ -1091,6 +1124,9 @@ impl RenderCallback for VizApp {
                             if let Some(id) = next {
                                 self.switch_to(&id);
                             }
+                        }
+                        WindowShortcut::CycleFirstChoice(direction) => {
+                            self.cycle_first_choice(direction);
                         }
                     }
                     return true;
@@ -2225,6 +2261,14 @@ mod tests {
             match_window_shortcut(PhysicalKey::Code(KeyCode::KeyU), &empty_key, primary),
             Some(WindowShortcut::CycleArtifact(CycleDirection::Prev))
         );
+        assert_eq!(
+            match_window_shortcut(PhysicalKey::Code(KeyCode::KeyJ), &empty_key, primary),
+            Some(WindowShortcut::CycleFirstChoice(CycleDirection::Next))
+        );
+        assert_eq!(
+            match_window_shortcut(PhysicalKey::Code(KeyCode::KeyK), &empty_key, primary),
+            Some(WindowShortcut::CycleFirstChoice(CycleDirection::Prev))
+        );
 
         let unidentified_physical =
             PhysicalKey::Unidentified(winit::keyboard::NativeKeyCode::Unidentified);
@@ -2235,6 +2279,22 @@ mod tests {
         assert_eq!(
             match_window_shortcut(unidentified_physical, &Key::Character("U".into()), primary),
             Some(WindowShortcut::CycleArtifact(CycleDirection::Prev))
+        );
+        assert_eq!(
+            match_window_shortcut(unidentified_physical, &Key::Character("j".into()), primary),
+            Some(WindowShortcut::CycleFirstChoice(CycleDirection::Next))
+        );
+        assert_eq!(
+            match_window_shortcut(unidentified_physical, &Key::Character("J".into()), primary),
+            Some(WindowShortcut::CycleFirstChoice(CycleDirection::Next))
+        );
+        assert_eq!(
+            match_window_shortcut(unidentified_physical, &Key::Character("k".into()), primary),
+            Some(WindowShortcut::CycleFirstChoice(CycleDirection::Prev))
+        );
+        assert_eq!(
+            match_window_shortcut(unidentified_physical, &Key::Character("K".into()), primary),
+            Some(WindowShortcut::CycleFirstChoice(CycleDirection::Prev))
         );
 
         // Without modifier or with extra Shift/Alt -> ignored.
@@ -2269,6 +2329,152 @@ mod tests {
                 primary | ModifiersState::SHIFT
             ),
             None
+        );
+        assert_eq!(
+            match_window_shortcut(
+                PhysicalKey::Code(KeyCode::KeyJ),
+                &empty_key,
+                ModifiersState::empty()
+            ),
+            None
+        );
+        assert_eq!(
+            match_window_shortcut(
+                PhysicalKey::Code(KeyCode::KeyK),
+                &empty_key,
+                ModifiersState::empty()
+            ),
+            None
+        );
+        assert_eq!(
+            match_window_shortcut(
+                PhysicalKey::Code(KeyCode::KeyJ),
+                &empty_key,
+                primary | ModifiersState::SHIFT
+            ),
+            None
+        );
+        assert_eq!(
+            match_window_shortcut(
+                PhysicalKey::Code(KeyCode::KeyK),
+                &empty_key,
+                primary | ModifiersState::ALT
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn viz_app_cycle_first_choice_updates_runtime_model_and_persists() {
+        const WITH_CHOICE: &str = r##"{
+          "contract": "1.0",
+          "meta": { "id": "with-choice", "name": "With Choice" },
+          "settings": {
+            "gain":   { "type": "number", "label": "Gain", "min": 0, "max": 2, "default": 1 },
+            "style":  { "type": "choice", "label": "Style", "options": ["neon", "warm", "mono"], "default": "warm" },
+            "accent": { "type": "choice", "label": "Accent", "options": ["low", "high"], "default": "low" }
+          },
+          "scene": [
+            { "type": "instanced", "shape": "rect", "count": "1",
+              "element": { "x": "0", "y": "0", "w": "0.1", "h": "0.1",
+                "color": { "model": "rgba", "r": "1", "g": "1", "b": "1" } } }
+          ]
+        }"##;
+        const WITHOUT_CHOICE: &str = r##"{
+          "contract": "1.0",
+          "meta": { "id": "without-choice", "name": "Without Choice" },
+          "settings": {
+            "gain": { "type": "number", "label": "Gain", "min": 0, "max": 2, "default": 1 }
+          },
+          "scene": [
+            { "type": "instanced", "shape": "rect", "count": "1",
+              "element": { "x": "0", "y": "0", "w": "0.1", "h": "0.1",
+                "color": { "model": "rgba", "r": "1", "g": "1", "b": "1" } } }
+          ]
+        }"##;
+
+        let lib = ArtifactLibrary::load_builtins([
+            ("with-choice", WITH_CHOICE),
+            ("without-choice", WITHOUT_CHOICE),
+        ]);
+        let with_choice_id = ArtifactId("with-choice".to_owned());
+        let without_choice_id = ArtifactId("without-choice".to_owned());
+
+        let persisted: Rc<RefCell<Vec<(ArtifactId, SettingValue)>>> =
+            Rc::new(RefCell::new(Vec::new()));
+        let persisted_hook = persisted.clone();
+
+        let mut app = VizApp::new(lib, Some(with_choice_id.clone()), false, None)
+            .on_setting_change(move |loaded, values| {
+                if let Some(v) = values.get("style").copied() {
+                    persisted_hook.borrow_mut().push((loaded.id.clone(), v));
+                }
+            });
+
+        // Initial default for "style" is "warm" (index 1).
+        assert_eq!(
+            app.active_settings().and_then(|s| s.get("style")).copied(),
+            Some(SettingValue::Scalar(1.0))
+        );
+        assert_eq!(
+            app.model.borrow().settings.choice_index_for_test("style"),
+            Some(1)
+        );
+
+        // Next: 1 -> 2 -> 0 (wraps forward).
+        assert!(app.cycle_first_choice(CycleDirection::Next));
+        assert_eq!(
+            app.active_settings().and_then(|s| s.get("style")).copied(),
+            Some(SettingValue::Scalar(2.0))
+        );
+        assert_eq!(
+            app.model.borrow().settings.choice_index_for_test("style"),
+            Some(2)
+        );
+        assert_eq!(
+            app.active_settings().and_then(|s| s.get("accent")).copied(),
+            Some(SettingValue::Scalar(0.0))
+        );
+
+        assert!(app.cycle_first_choice(CycleDirection::Next));
+        assert_eq!(
+            app.active_settings().and_then(|s| s.get("style")).copied(),
+            Some(SettingValue::Scalar(0.0))
+        );
+        assert_eq!(
+            app.model.borrow().settings.choice_index_for_test("style"),
+            Some(0)
+        );
+
+        // Prev: 0 -> 2 (wraps backward).
+        assert!(app.cycle_first_choice(CycleDirection::Prev));
+        assert_eq!(
+            app.active_settings().and_then(|s| s.get("style")).copied(),
+            Some(SettingValue::Scalar(2.0))
+        );
+        assert_eq!(
+            app.model.borrow().settings.choice_index_for_test("style"),
+            Some(2)
+        );
+
+        assert_eq!(
+            *persisted.borrow(),
+            vec![
+                (with_choice_id.clone(), SettingValue::Scalar(2.0)),
+                (with_choice_id.clone(), SettingValue::Scalar(0.0)),
+                (with_choice_id, SettingValue::Scalar(2.0)),
+            ]
+        );
+
+        // Switch to an artifact with no Choice setting -> clean no-op, no persistence call.
+        assert!(app.switch_to(&without_choice_id));
+        let count_before = persisted.borrow().len();
+        assert!(!app.cycle_first_choice(CycleDirection::Next));
+        assert!(!app.cycle_first_choice(CycleDirection::Prev));
+        assert_eq!(persisted.borrow().len(), count_before);
+        assert_eq!(
+            app.active_settings().and_then(|s| s.get("gain")).copied(),
+            Some(SettingValue::Scalar(1.0))
         );
     }
 

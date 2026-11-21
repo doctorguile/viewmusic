@@ -22,6 +22,10 @@ pub struct FeatureFrame {
     pub t: f64,
     /// Log-spaced bands, 30 Hz–16 kHz, per-band AGC normalized 0..1.
     pub bands: [f32; BAND_COUNT],
+    /// Shared-AGC musical dB-scaled spectrum (0..1) preserving tonal contrast across bass/mid/treble.
+    pub bands_db: [f32; BAND_COUNT],
+    /// Hardware peak-hold cap per band (0..1) with hold timer + gravity fall.
+    pub band_peaks: [f32; BAND_COUNT],
     /// Aggregate < 250 Hz, 0..1.
     pub low: f32,
     /// Aggregate 250 Hz–4 kHz, 0..1.
@@ -46,6 +50,8 @@ impl Default for FeatureFrame {
         Self {
             t: 0.0,
             bands: [0.0; BAND_COUNT],
+            bands_db: [0.0; BAND_COUNT],
+            band_peaks: [0.0; BAND_COUNT],
             low: 0.0,
             mid: 0.0,
             high: 0.0,
@@ -64,6 +70,21 @@ impl FeatureFrame {
     #[inline]
     pub fn band(&self, u: f64) -> f64 {
         lookup_lerp_fixed(&self.bands, u)
+    }
+
+    /// Interpolated shared-AGC musical dB-scaled level lookup at normalized position `u` ∈ 0..1
+    /// (contract `level(u)`). Exact band k (0..47) is `level(k/47)`. Out-of-range `u` is clamped;
+    /// non-finite → 0.
+    #[inline]
+    pub fn level(&self, u: f64) -> f64 {
+        lookup_lerp_fixed(&self.bands_db, u)
+    }
+
+    /// Interpolated peak-hold cap lookup at normalized position `u` ∈ 0..1 (contract `peak(u)`).
+    /// Exact band k (0..47) is `peak(k/47)`. Out-of-range `u` is clamped; non-finite → 0.
+    #[inline]
+    pub fn peak(&self, u: f64) -> f64 {
+        lookup_lerp_fixed(&self.band_peaks, u)
     }
 
     /// Interpolated waveform lookup at `u` ∈ 0..1 (contract `wave(u)`).
@@ -183,6 +204,44 @@ mod tests {
         assert!((f.band(step / 2.0) - 0.5).abs() < 1e-9);
         assert_eq!(f.band(-1.0), 0.0);
         assert_eq!(f.band(f64::NAN), 0.0);
+    }
+
+    #[test]
+    fn level_lookup_interpolates_clamps_and_handles_non_finite() {
+        let mut f = FeatureFrame::default();
+        assert_eq!(f.bands_db, [0.0; BAND_COUNT]);
+        f.bands_db[0] = 0.2;
+        f.bands_db[1] = 0.8;
+        f.bands_db[BAND_COUNT - 1] = 0.9;
+        let step = 1.0 / (BAND_COUNT - 1) as f64;
+        assert!((f.level(0.0) - 0.2).abs() < 1e-6);
+        assert!((f.level(step) - 0.8).abs() < 1e-6);
+        assert!((f.level(step / 2.0) - 0.5).abs() < 1e-6);
+        assert!((f.level(1.0) - 0.9).abs() < 1e-6);
+        assert!((f.level(-1.0) - 0.2).abs() < 1e-6);
+        assert!((f.level(2.0) - 0.9).abs() < 1e-6);
+        assert_eq!(f.level(f64::NAN), 0.0);
+        assert_eq!(f.level(f64::INFINITY), 0.0);
+        assert_eq!(f.level(f64::NEG_INFINITY), 0.0);
+    }
+
+    #[test]
+    fn peak_lookup_interpolates_clamps_and_handles_non_finite() {
+        let mut f = FeatureFrame::default();
+        assert_eq!(f.band_peaks, [0.0; BAND_COUNT]);
+        f.band_peaks[0] = 0.1;
+        f.band_peaks[1] = 0.7;
+        f.band_peaks[BAND_COUNT - 1] = 0.95;
+        let step = 1.0 / (BAND_COUNT - 1) as f64;
+        assert!((f.peak(0.0) - 0.1).abs() < 1e-6);
+        assert!((f.peak(step) - 0.7).abs() < 1e-6);
+        assert!((f.peak(step / 2.0) - 0.4).abs() < 1e-6);
+        assert!((f.peak(1.0) - 0.95).abs() < 1e-6);
+        assert!((f.peak(-0.5) - 0.1).abs() < 1e-6);
+        assert!((f.peak(1.5) - 0.95).abs() < 1e-6);
+        assert_eq!(f.peak(f64::NAN), 0.0);
+        assert_eq!(f.peak(f64::INFINITY), 0.0);
+        assert_eq!(f.peak(f64::NEG_INFINITY), 0.0);
     }
 
     #[test]

@@ -1,16 +1,16 @@
-//! Instanced quads (rect / circle / triangle), two blend modes.
+//! Instanced quads (rect / circle / triangle / pill / glow), two blend modes.
 //!
 //! ## Pipeline strategy (justification)
 //! Shape masking and blend mode are both *per-layer* constants, never per-instance. The
 //! shape mask is cheapest to select at pipeline level (the fragment shader for each shape
 //! has a distinct, branchless discard test), and wgpu's `downlevel_defaults` limits — the
 //! device this runs on — do NOT guarantee push constants, so a per-draw push-constant
-//! "shape id" is not portable here. We therefore build a small **3 shapes × 2 blends = 6
+//! "shape id" is not portable here. We therefore build a small **5 shapes × 2 blends = 10
 //! pipeline** table sharing one vertex shader and one WGSL module. This avoids a per-draw
 //! uniform rebind (and the within-frame aliasing that a single shared uniform buffer would
 //! cause when many draws record into one encoder), keeps the hot path to "set pipeline →
-//! set vertex buffer slice → draw", and costs only 6 cheap pipeline objects at startup.
-//! The table exists once per [`PassTargets`] (12 pipelines in all).
+//! set vertex buffer slice → draw", and costs only 10 cheap pipeline objects at startup.
+//! The table exists once per [`PassTargets`] (20 pipelines in all).
 //!
 //! No viewport uniform is needed here: shapes are defined entirely in NDC, so there is no
 //! screen-space conversion (unlike polylines). Instanced draws use no bind groups at all.
@@ -18,8 +18,9 @@
 //! ## Geometry
 //! One unit quad (two triangles, 6 vertices in `[-0.5, 0.5]²` "local" space) is expanded
 //! per instance in the vertex shader: scale by `w`/`h`, rotate by `rot`, translate to
-//! `x`/`y`. The local coordinate is forwarded so the fragment shader can mask circle and
-//! triangle shapes. Colors are premultiplied in the shader before blending.
+//! `x`/`y`. The local coordinate and absolute quad size are forwarded so the fragment
+//! shader can mask circle, triangle, pill, and glow shapes. Colors are premultiplied in
+//! the shader before blending.
 
 use std::num::NonZeroU64;
 
@@ -55,7 +56,7 @@ struct LayerRecord {
 /// All instanced pipelines and the shared, pre-allocated buffers.
 pub struct InstancedPipelines {
     /// `pipelines[targets][shape][blend]`.
-    pipelines: [[[wgpu::RenderPipeline; 2]; 3]; 2],
+    pipelines: [[[wgpu::RenderPipeline; 2]; 5]; 2],
     /// Static unit-quad vertex buffer.
     quad: wgpu::Buffer,
     /// Copy destination for instances (capacity `MAX_LAYERS * MAX_INSTANCES`); `None` when
@@ -66,7 +67,7 @@ pub struct InstancedPipelines {
 }
 
 impl InstancedPipelines {
-    /// Builds the 12 pipelines and allocates the static quad (+ the instance copy target
+    /// Builds the 20 pipelines and allocates the static quad (+ the instance copy target
     /// unless uploads are `direct`).
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat, direct: bool) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -94,8 +95,14 @@ impl InstancedPipelines {
         };
 
         let fs_entries = [
-            ["fs_rect", "fs_circle", "fs_triangle"],
-            ["fs_rect_mrt", "fs_circle_mrt", "fs_triangle_mrt"],
+            ["fs_rect", "fs_circle", "fs_triangle", "fs_pill", "fs_glow"],
+            [
+                "fs_rect_mrt",
+                "fs_circle_mrt",
+                "fs_triangle_mrt",
+                "fs_pill_mrt",
+                "fs_glow_mrt",
+            ],
         ];
         let blends = [BlendMode::Alpha, BlendMode::Add];
 

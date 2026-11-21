@@ -98,6 +98,8 @@ pub enum Op {
     Step,
     If,
     Band,
+    Level,
+    Peak,
     Wave,
     Rand,
 }
@@ -262,13 +264,13 @@ impl MultiProgram {
 }
 
 /// The formula evaluator. Holds the slot bank, the latest [`FeatureFrame`] for
-/// `band()`/`wave()`, and the artifact seed for `rand()`. One `Vm` is reused
+/// `band()`/`level()`/`peak()`/`wave()`, and the artifact seed for `rand()`. One `Vm` is reused
 /// across frames and elements (no per-frame allocation): set
 /// the shared/element slots and the frame, then call [`Vm::eval`] repeatedly.
 pub struct Vm {
     /// Slot bank: one pre-sanitized f64 per declared identifier in [`Scope`](crate::Scope).
     slots: Vec<f64>,
-    /// Latest audio features (powers `band(u)`/`wave(u)`).
+    /// Latest audio features (powers `band(u)`/`level(u)`/`peak(u)`/`wave(u)`).
     frame: FeatureFrame,
     /// Artifact seed for deterministic `rand(k)`.
     seed: u64,
@@ -332,8 +334,8 @@ impl Vm {
         self.slots.get(slot.0 as usize).copied().unwrap_or(0.0)
     }
 
-    /// Installs the latest audio feature frame (POD copy). Powers `band()` and
-    /// `wave()` for subsequent evaluations.
+    /// Installs the latest audio feature frame (POD copy). Powers `band()`,
+    /// `level()`, `peak()`, and `wave()` for subsequent evaluations.
     #[inline]
     pub fn set_frame(&mut self, frame: &FeatureFrame) {
         self.frame = *frame;
@@ -576,11 +578,13 @@ impl Vm {
     /// Applies a built-in to its operand slice `a` (length == the op's arity).
     /// All inputs are already sanitized (finite); the caller sanitizes the
     /// result. Public so the property test's reference evaluator uses identical
-    /// semantics, including the frame-dependent `band`/`wave`/`rand`.
+    /// semantics, including the frame-dependent `band`/`level`/`peak`/`wave`/`rand`.
     #[inline]
     pub fn apply_builtin(&self, b: BuiltinOp, a: &[f64]) -> f64 {
         match b {
             BuiltinOp::Band => self.frame.band(a[0]),
+            BuiltinOp::Level => self.frame.level(a[0]),
+            BuiltinOp::Peak => self.frame.peak(a[0]),
             BuiltinOp::Wave => self.frame.wave(a[0]),
             BuiltinOp::Rand => self.rand(a[0]),
             other => apply_pure_builtin(other, a).unwrap_or(0.0),
@@ -958,6 +962,18 @@ fn run_ops(
                 }
                 stack[sp - 1] = frame.band(stack[sp - 1]);
             }
+            Op::Level => {
+                if sp < 1 {
+                    return 0.0;
+                }
+                stack[sp - 1] = frame.level(stack[sp - 1]);
+            }
+            Op::Peak => {
+                if sp < 1 {
+                    return 0.0;
+                }
+                stack[sp - 1] = frame.peak(stack[sp - 1]);
+            }
             Op::Wave => {
                 if sp < 1 {
                     return 0.0;
@@ -1170,6 +1186,8 @@ fn run_ops_batch(
             Op::Step => binary!(step),
             Op::If => ternary!(|c: f64, a: f64, b: f64| if truthy(c) { a } else { b }),
             Op::Band => unary!(|a: f64| frame.band(a)),
+            Op::Level => unary!(|a: f64| frame.level(a)),
+            Op::Peak => unary!(|a: f64| frame.peak(a)),
             Op::Wave => unary!(|a: f64| frame.wave(a)),
             Op::Rand => unary!(|k: f64| rand_hash(seed, k)),
         }
@@ -1213,7 +1231,11 @@ pub(crate) fn apply_pure_builtin(b: BuiltinOp, a: &[f64]) -> Option<f64> {
                 a[2]
             }
         }
-        BuiltinOp::Band | BuiltinOp::Wave | BuiltinOp::Rand => return None,
+        BuiltinOp::Band
+        | BuiltinOp::Level
+        | BuiltinOp::Peak
+        | BuiltinOp::Wave
+        | BuiltinOp::Rand => return None,
     })
 }
 

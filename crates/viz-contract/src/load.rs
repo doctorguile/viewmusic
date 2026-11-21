@@ -12,7 +12,7 @@
 //! 1. **Size** — reject files larger than [`limits::MAX_FILE_BYTES`], then JSON
 //!    parse to [`serde_json::Value`] ([`LoadStep::Parse`]).
 //! 2. **Version** — *before* schema validation: `contract` must be a string
-//!    `"MAJOR.MINOR"` with `MAJOR == 1` and `MINOR <= 0`; otherwise reject with
+//!    `"MAJOR.MINOR"` with `MAJOR == 1` and `MINOR <= 1`; otherwise reject with
 //!    exactly `unsupported contract version X.Y` ([`LoadStep::Version`]).
 //! 3. **Schema** — JSON Schema (draft 2020-12) validation against the schema
 //!    generated once from [`Artifact`] via `schemars` and compiled once with the
@@ -92,7 +92,7 @@ const RESERVED_HOST_NAMES: [&str; 14] = [
 
 /// `viz-expr` built-in function and constant names (contract §2.2). A setting or
 /// var bearing one of these is rejected at the semantic step.
-const RESERVED_BUILTIN_NAMES: [&str; 32] = [
+const RESERVED_BUILTIN_NAMES: [&str; 34] = [
     "sin",
     "cos",
     "tan",
@@ -120,6 +120,8 @@ const RESERVED_BUILTIN_NAMES: [&str; 32] = [
     "step",
     "if",
     "band",
+    "level",
+    "peak",
     "wave",
     "rand",
     "pi",
@@ -624,7 +626,7 @@ pub fn load_artifact(source_name: &str, bytes: &[u8]) -> Result<LoadedArtifact, 
 // Step 2: version gate
 // ---------------------------------------------------------------------------
 
-/// Verifies `contract == "1.<minor>"` with `minor <= 0` (contract §10). Runs
+/// Verifies `contract == "1.<minor>"` with `minor <= 1` (contract §10). Runs
 /// before schema validation so an out-of-range version produces the clear
 /// `unsupported contract version X.Y` message, not a pattern error.
 fn check_version(source_name: &str, value: &Value) -> Result<(), LoadDiagnostic> {
@@ -667,7 +669,7 @@ fn check_version(source_name: &str, value: &Value) -> Result<(), LoadDiagnostic>
         ));
     };
 
-    if major != 1 || minor > 0 {
+    if major != 1 || minor > 1 {
         return Err(unsupported(raw));
     }
     Ok(())

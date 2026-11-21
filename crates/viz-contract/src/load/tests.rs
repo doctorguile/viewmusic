@@ -154,15 +154,25 @@ fn rejects_unsupported_major_version() {
     assert_eq!(err.message, "unsupported contract version 2.0");
 }
 
-/// A newer minor (1.1) is also rejected at the Version step (loader supports ≤ 1.0).
+/// Contract "1.1" is accepted by the v1.1 loader.
 #[test]
-fn rejects_newer_minor_version() {
+fn accepts_contract_v1_1() {
     let mut doc = minimal_doc();
     doc["contract"] = serde_json::json!("1.1");
     let bytes = serde_json::to_vec(&doc).unwrap();
-    let err = load_artifact("v11.artifact.json", &bytes).expect_err("1.1 must be rejected");
+    let loaded = load_artifact("v11.artifact.json", &bytes).expect("1.1 must be accepted");
+    assert_eq!(loaded.artifact.contract, "1.1");
+}
+
+/// A newer minor (1.2) is rejected at the Version step (loader supports ≤ 1.1).
+#[test]
+fn rejects_newer_minor_version() {
+    let mut doc = minimal_doc();
+    doc["contract"] = serde_json::json!("1.2");
+    let bytes = serde_json::to_vec(&doc).unwrap();
+    let err = load_artifact("v12.artifact.json", &bytes).expect_err("1.2 must be rejected");
     assert_eq!(err.step, LoadStep::Version);
-    assert_eq!(err.message, "unsupported contract version 1.1");
+    assert_eq!(err.message, "unsupported contract version 1.2");
 }
 
 /// The version gate runs BEFORE schema validation: a newer version with an
@@ -337,6 +347,117 @@ fn rejects_setting_named_beat() {
     assert_eq!(err.step, LoadStep::Semantic);
     assert_eq!(err.json_path, "settings.beat");
     assert!(err.message.contains("reserved"), "message: {}", err.message);
+}
+
+/// Settings named `level` or `peak` collide with v1.1 built-ins at the Semantic step.
+#[test]
+fn rejects_settings_named_level_or_peak() {
+    for reserved in ["level", "peak"] {
+        let doc = serde_json::json!({
+            "contract": "1.1",
+            "meta": { "id": "x", "name": "X" },
+            "settings": {
+                reserved: { "type": "number", "label": "Reserved", "min": 0, "max": 1, "default": 0 }
+            },
+            "scene": [
+                { "type": "field", "resolution": 4,
+                  "cell": { "color": { "model": "rgba", "r": 1, "g": 0, "b": 0 } } }
+            ]
+        });
+        let bytes = serde_json::to_vec(&doc).unwrap();
+        let err = load_artifact("reserved.artifact.json", &bytes)
+            .expect_err("setting colliding with level/peak must be rejected");
+        assert_eq!(err.step, LoadStep::Semantic);
+        assert_eq!(err.json_path, format!("settings.{reserved}"));
+        assert!(err.message.contains("reserved"), "message: {}", err.message);
+    }
+}
+
+/// A contract "1.1" artifact using `level(u)`, `peak(u)`, shape `"pill"`, and
+/// shape `"glow"` loads, validates, and evaluates cleanly.
+#[test]
+fn loads_contract_v1_1_with_level_peak_pill_and_glow() {
+    let doc = serde_json::json!({
+        "contract": "1.1",
+        "meta": { "id": "v11-demo", "name": "v1.1 Demo" },
+        "scene": [
+            {
+                "type": "instanced",
+                "shape": "pill",
+                "count": 32,
+                "element": {
+                    "x": "-1 + 2 * u",
+                    "y": "-1 + level(u)",
+                    "w": "1.5 / n",
+                    "h": "2 * level(u)",
+                    "color": { "model": "rgba", "r": "level(u)", "g": "peak(u)", "b": 0.5, "a": 1 }
+                }
+            },
+            {
+                "type": "instanced",
+                "shape": "glow",
+                "blend": "add",
+                "count": 32,
+                "element": {
+                    "x": "-1 + 2 * u",
+                    "y": "-1 + 2 * peak(u)",
+                    "w": "2.5 / n",
+                    "h": "0.12",
+                    "color": { "model": "hsva", "h": "u * 360", "s": 0.9, "v": "peak(u)", "a": 0.7 }
+                }
+            }
+        ]
+    });
+    let bytes = serde_json::to_vec(&doc).unwrap();
+    let loaded = load_artifact("v11-demo.artifact.json", &bytes)
+        .expect("v1.1 artifact with level, peak, pill, glow must load");
+
+    assert_eq!(loaded.artifact.contract, "1.1");
+    assert_eq!(loaded.artifact.scene.len(), 2);
+    assert!(matches!(
+        loaded.artifact.scene[0],
+        Layer::Instanced {
+            shape: crate::Shape::Pill,
+            ..
+        }
+    ));
+    assert!(matches!(
+        loaded.artifact.scene[1],
+        Layer::Instanced {
+            shape: crate::Shape::Glow,
+            ..
+        }
+    ));
+
+    // Verify compiled formulas actually read FeatureFrame::level and FeatureFrame::peak.
+    let mut frame = viz_core::FeatureFrame::default();
+    frame.bands_db[0] = 0.4;
+    frame.band_peaks[0] = 0.85;
+
+    let mut vm = Vm::new(loaded.layout.slot_count, loaded.seed);
+    vm.set_frame(&frame);
+    vm.set_slot(loaded.layout.u, 0.0);
+
+    match &loaded.programs.layers[0] {
+        LayerPrograms::Instanced { h, .. } => {
+            let h_val = h.value(&mut vm);
+            assert!(
+                (h_val - 0.8).abs() < 1e-6,
+                "expected 2 * 0.4 = 0.8, got {h_val}"
+            );
+        }
+        other => panic!("expected Instanced layer, got {other:?}"),
+    }
+    match &loaded.programs.layers[1] {
+        LayerPrograms::Instanced { y, .. } => {
+            let y_val = y.value(&mut vm);
+            assert!(
+                (y_val - (-1.0 + 2.0 * 0.85)).abs() < 1e-6,
+                "expected -1 + 2 * 0.85, got {y_val}"
+            );
+        }
+        other => panic!("expected Instanced layer, got {other:?}"),
+    }
 }
 
 /// A color setting whose `_r` expansion collides with another setting is rejected.
