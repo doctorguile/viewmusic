@@ -20,7 +20,8 @@
 //! per instance in the vertex shader: scale by `w`/`h`, rotate by `rot`, translate to
 //! `x`/`y`. The local coordinate and absolute quad size are forwarded so the fragment
 //! shader can mask circle, triangle, pill, and glow shapes. Colors are premultiplied in
-//! the shader before blending.
+//! the shader before blending. Instances with straight alpha `<= 0` would blend as a
+//! no-op, so the vertex shader collapses them to a point and they emit no fragments.
 
 use std::num::NonZeroU64;
 

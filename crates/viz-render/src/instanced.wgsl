@@ -23,6 +23,16 @@ fn vs_main(
     @location(2) rot: f32,               // radians, CCW
     @location(3) color: vec4<f32>,       // straight-alpha RGBA, 0..1
 ) -> VsOut {
+    var out: VsOut;
+    // Every fragment path outputs premul(rgb, a * k), which is exactly vec4(0) when the
+    // straight alpha is <= 0 (the CPU clamps it to 0..1), and vec4(0) is a no-op under
+    // both blend states. Collapse such instances to one point so the rasterizer emits no
+    // fragments (e.g. the unlit cells of full-grid glow / pill bar layers).
+    if (color.a <= 0.0) {
+        out.clip = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+        return out;
+    }
+
     let center = xywh.xy;
     let size = xywh.zw;
     // Scale into NDC half-extents.
@@ -36,7 +46,6 @@ fn vs_main(
     );
     let pos = center + rotated;
 
-    var out: VsOut;
     out.clip = vec4<f32>(pos, 0.0, 1.0);
     out.local = quad;
     out.color = color;

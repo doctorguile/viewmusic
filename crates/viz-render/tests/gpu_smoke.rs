@@ -141,6 +141,7 @@ on_both_upload_paths!(
     transparent_bg_clears_alpha_to_zero_on_direct_and_feedback_paths,
     leading_opaque_field_matches_blended_draw_under_feedback,
     partial_field_matches_zero_padded_field_under_add,
+    instanced_zero_alpha_instances_leave_target_unchanged,
 );
 
 /// Creates an offscreen RGBA8 render target (sampleable not needed; COPY_SRC for readback).
@@ -889,4 +890,64 @@ fn partial_field_matches_zero_padded_field_under_add(device: &wgpu::Device, queu
         missing,
         "present cells must add onto the backdrop"
     );
+}
+
+/// The instanced vertex shader collapses instances with straight alpha `<= 0` so they emit
+/// no fragments. That must be invisible: every shape under both blends, with a zero-alpha
+/// bright instance covering the screen, leaves the backdrop exactly as drawn alone (also on
+/// the feedback MRT path, where the accumulator receives the same output).
+fn instanced_zero_alpha_instances_leave_target_unchanged(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) {
+    let invisible = [InstanceData {
+        x: 0.0,
+        y: 0.0,
+        w: 2.0,
+        h: 2.0,
+        rot: 0.0,
+        color: [1.0, 1.0, 1.0, 0.0],
+    }];
+    let shapes = [
+        ShapeKind::Rect,
+        ShapeKind::Circle,
+        ShapeKind::Triangle,
+        ShapeKind::Pill,
+        ShapeKind::Glow,
+    ];
+    let mut layers = vec![backdrop()];
+    for shape in shapes {
+        for blend in [BlendMode::Alpha, BlendMode::Add] {
+            layers.push(LayerDraw::Instanced {
+                shape,
+                blend,
+                instances: &invisible,
+            });
+        }
+    }
+
+    for params in [
+        SceneParams::default(),
+        SceneParams {
+            feedback_decay: Some(0.9),
+            ..SceneParams::default()
+        },
+    ] {
+        let render = |layers: &[LayerDraw]| {
+            let mut renderer = Renderer::new(device, queue, FORMAT);
+            renderer.resize(device, W, H);
+            render_scene(device, queue, &mut renderer, &params, layers)
+        };
+        let backdrop_only = render(&[backdrop()]);
+        let with_invisible = render(&layers);
+        assert_same_pixels(
+            &backdrop_only,
+            &with_invisible,
+            "backdrop vs backdrop + zero-alpha instances",
+        );
+        assert!(
+            !is_clearish(backdrop_only.at_ndc(0.0, 0.0)),
+            "the backdrop must be visible"
+        );
+    }
 }
