@@ -8,9 +8,11 @@
 //! Startup: load the built-in artifacts into an
 //! [`ArtifactLibrary`], then scan the user artifacts folder (created if missing) for
 //! `*.artifact.json` files appended after the built-ins; read the persisted
-//! [`AppState`] and [`WindowState`], resolve the artifact to activate (saved id if
-//! still present, else the first built-in), and restore the overlay collapse and
-//! window geometry. The dropdown selection, collapse toggle, and window moves are
+//! [`AppState`] and [`WindowProfiles`], resolve the artifact to activate (saved id if
+//! still present, else the first built-in), and restore the overlay collapse. The
+//! window's geometry and chrome are restored per monitor configuration by the
+//! [`PlacementTracker`] handed to the [`VizApp`], once the connected displays are
+//! known at window creation. The dropdown selection and collapse toggle are
 //! persisted live through hooks on the [`VizApp`]; the "Reload artifacts" action
 //! re-runs the same library-build closure to pick up folder changes without a
 //! restart.
@@ -27,10 +29,11 @@ use winit::event_loop::EventLoop;
 
 use indexmap::IndexMap;
 use viz_app::logging;
-use viz_app::persist::{ensure_artifacts_dir, should_save_window, AppState, WindowState};
+use viz_app::persist::{ensure_artifacts_dir, should_save_window, AppState};
+use viz_app::placement::{PlacementTracker, WindowProfiles};
 use viz_app::runtime::SettingValue;
 use viz_app::viz::VizApp;
-use viz_app::window::{App, InitialWindow, WindowMode};
+use viz_app::window::App;
 use viz_audio::AudioPipeline;
 use viz_contract::{ArtifactLibrary, LoadedArtifact};
 
@@ -141,24 +144,15 @@ fn main() {
         "built artifact library"
     );
 
-    // Restore persisted state: last artifact, overlay collapse, window geometry.
+    // Restore persisted state: last artifact and overlay collapse (global), and the
+    // per-monitor-config window profiles (applied once the window's displays are known).
     let app_state = AppState::load();
-    let initial_window = WindowState::load().map(|w| InitialWindow {
-        x: w.x,
-        y: w.y,
-        width: w.width,
-        height: w.height,
-    });
+    let window_placement = PlacementTracker::new(WindowProfiles::load(), WindowProfiles::save);
     let active_id = app_state.resolve_artifact(&library);
     if let Some(id) = active_id.as_ref() {
         tracing::info!(target: "viewmusic", id = %id, "resolved active artifact");
     }
     let overlay_collapsed = app_state.overlay_collapsed;
-    let window_mode = WindowMode {
-        borderless: app_state.borderless,
-        transparent: app_state.transparent,
-        always_on_top: app_state.always_on_top,
-    };
 
     // Start system-audio capture. This always runs the full create-tap → aggregate
     // → IOProc → AudioDeviceStart sequence — that *is* what triggers the macOS TCC
@@ -180,9 +174,9 @@ fn main() {
     // `App::about_to_wait` drives frame pacing via `ControlFlow::WaitUntil` / `Wait`
     // so the main thread sleeps in the OS kernel between frames instead of spinning.
 
-    // Shared, mutable persisted state: the VizApp hooks update it live; we save the
-    // relevant document immediately on each change (small, discrete writes — the
-    // chatty window geometry is debounced inside VizApp before reaching its hook).
+    // Shared, mutable persisted state: the VizApp hooks update it live; we save it
+    // immediately on each change (small, discrete writes). Window state is saved by
+    // the placement tracker inside VizApp.
     let state = Rc::new(RefCell::new(app_state));
 
     // Debounce for the chatty setting-edit writes: a slider drag fires
@@ -208,17 +202,6 @@ fn main() {
             s.save();
         }
     };
-    let on_window_mode = {
-        let state = state.clone();
-        move |mode: WindowMode| {
-            let mut s = state.borrow_mut();
-            s.borderless = mode.borderless;
-            s.transparent = mode.transparent;
-            s.always_on_top = mode.always_on_top;
-            s.save();
-        }
-    };
-    let on_window = |ws: WindowState| ws.save();
 
     // Restore validated per-artifact setting overrides for the active artifact at
     // startup + on every switch. Validation lives in persist.rs.
@@ -247,29 +230,24 @@ fn main() {
     };
 
     let viz_app = VizApp::new(library, active_id, overlay_collapsed, audio)
-        .with_window_mode(window_mode)
+        .with_window_placement(window_placement)
         .on_artifact_change(on_select)
         .on_collapse_change(on_collapse)
-        .on_window_mode_change(on_window_mode)
-        .on_window_change(on_window)
         .on_setting_change(on_setting_change)
         .on_setting_restore(on_setting_restore)
         // "Reload artifacts" rebuilds the library exactly as at startup.
         .on_reload_artifacts(build_library);
 
-    let mut app = App::new(viz_app)
-        .with_initial_window(initial_window)
-        .with_window_mode(window_mode)
-        .on_ready(|gpu, win, viz_app| {
-            viz_app.attach_gpu(&gpu.device, &gpu.queue, win, gpu.format);
-        });
+    let mut app = App::new(viz_app).on_ready(|gpu, win, viz_app| {
+        viz_app.attach_gpu(&gpu.device, &gpu.queue, win, gpu.format);
+    });
 
     if let Err(e) = event_loop.run_app(&mut app) {
         tracing::error!(target: "viewmusic", error = %e, "event loop terminated with error");
     }
 
-    // Final save of the top-level app state on quit. Window geometry was
-    // flushed by the VizApp on CloseRequested.
+    // Final save of the top-level app state on quit. Window state was flushed by
+    // the VizApp's placement tracker on CloseRequested.
     state.borrow().save();
 
     // Dropping `app` here drops the VizApp → AudioHandle::Drop runs the capture

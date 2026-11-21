@@ -40,12 +40,12 @@ use crate::app_state::{
     SETTINGS_URL, WAITING_FOR_AUDIO_HINT, WAITING_FOR_AUDIO_TITLE,
 };
 use crate::overlay::{decide_visibility, Overlay, OVERLAY_AREA_ID};
-use crate::persist::{should_save_window, WindowState, WINDOW_SAVE_DEBOUNCE};
+use crate::placement::{MonitorConfig, PlacementTracker, WindowPlacement};
 use crate::runtime::{ArtifactRuntime, SettingValue};
 use crate::settings_panel::{SettingChange, SettingsPanel};
 use crate::window::{
-    apply_window_mode, apply_window_size_preset, detect_size_preset, FrameContext, RenderCallback,
-    WindowMode, WindowSizePreset,
+    apply_window_geometry, apply_window_mode, apply_window_size_preset, detect_size_preset,
+    snapshot_window, FrameContext, RenderCallback, WindowMode, WindowSizePreset,
 };
 
 /// Maximum `dt` (seconds) handed to the artifact in any one frame. A long stall
@@ -226,14 +226,6 @@ type ArtifactChangeHook = Box<dyn FnMut(&ArtifactId)>;
 /// persist it.
 type CollapseChangeHook = Box<dyn FnMut(bool)>;
 
-/// A callback invoked (debounced) when the window moves/resizes, so the host can
-/// persist its geometry.
-type WindowChangeHook = Box<dyn FnMut(WindowState)>;
-
-/// A callback invoked when any window presentation flag (borderless, transparent,
-/// always-on-top) changes, so the host can persist it immediately.
-type WindowModeChangeHook = Box<dyn FnMut(WindowMode)>;
-
 /// A callback invoked when a setting is edited or reset, so the host can persist the
 /// new per-artifact setting values. Receives the active artifact (for
 /// its id + declarations, so the host can encode each value per kind) and its full
@@ -283,10 +275,10 @@ pub struct VizApp {
     on_artifact_change: Option<ArtifactChangeHook>,
     /// Optional hook to persist a new collapse state.
     on_collapse_change: Option<CollapseChangeHook>,
-    /// Optional hook to persist window geometry on move/resize.
-    on_window_change: Option<WindowChangeHook>,
-    /// Optional hook to persist window mode flags on toggle.
-    on_window_mode_change: Option<WindowModeChangeHook>,
+    /// Remembers window geometry + chrome per monitor configuration and reports when
+    /// a display change calls for another placement (in-memory only unless the host
+    /// supplies a persisting tracker via [`Self::with_window_placement`]).
+    placement: PlacementTracker,
     /// Current live window mode flags (borderless, transparent, always-on-top).
     window_mode: WindowMode,
     /// Latest keyboard modifier state (drives `Cmd+1..5`, `Cmd+W`, `Cmd+T`, `Cmd+Y`, `Cmd+U`, `Cmd+J`, `Cmd+K` shortcuts).
@@ -314,8 +306,6 @@ pub struct VizApp {
     /// Optional hook to rebuild the library (built-ins + user folder) from scratch on
     /// the "Reload artifacts" action.
     rebuild_library: Option<LibraryBuilder>,
-    /// Instant of the last window-state write (debounce).
-    last_window_save: Option<Instant>,
 
     /// The GPU scene renderer (built in `attach_gpu`, once the format is known).
     renderer: Option<Renderer>,
@@ -420,8 +410,7 @@ impl VizApp {
             pointer_moved_since_render: false,
             on_artifact_change: None,
             on_collapse_change: None,
-            on_window_change: None,
-            on_window_mode_change: None,
+            placement: PlacementTracker::default(),
             window_mode: WindowMode::default(),
             modifiers: ModifiersState::empty(),
             last_view_active: false,
@@ -433,7 +422,6 @@ impl VizApp {
             on_setting_change: None,
             on_setting_restore: None,
             rebuild_library: None,
-            last_window_save: None,
             renderer: None,
             runtime,
             degrade: DegradeController::new(),
@@ -485,27 +473,14 @@ impl VizApp {
         self
     }
 
-    /// Registers a hook called (debounced) when the window moves/resizes, with the
-    /// new geometry to persist.
+    /// Supplies the per-monitor-config window placement tracker (loaded from and
+    /// saving to `window_state.json`). It decides the window's launch geometry and
+    /// chrome, records moves and chrome toggles for the current monitor
+    /// configuration, and restores another configuration's placement when the
+    /// connected displays change.
     #[must_use]
-    pub fn on_window_change(mut self, f: impl FnMut(WindowState) + 'static) -> Self {
-        self.on_window_change = Some(Box::new(f));
-        self
-    }
-
-    /// Sets the initial [`WindowMode`] (restored from persisted [`AppState`]).
-    #[must_use]
-    pub fn with_window_mode(mut self, mode: WindowMode) -> Self {
-        self.window_mode = mode;
-        self.model.borrow_mut().window_mode = mode;
-        self
-    }
-
-    /// Registers a hook called whenever [`WindowMode`] changes so the host can
-    /// persist the updated flags immediately.
-    #[must_use]
-    pub fn on_window_mode_change(mut self, f: impl FnMut(WindowMode) + 'static) -> Self {
-        self.on_window_mode_change = Some(Box::new(f));
+    pub fn with_window_placement(mut self, placement: PlacementTracker) -> Self {
+        self.placement = placement;
         self
     }
 
@@ -677,19 +652,6 @@ impl VizApp {
         }
     }
 
-    /// Reads the window's current geometry into a [`WindowState`] (physical pixels).
-    /// `None` if the platform cannot report the outer position.
-    fn current_window_state(window: &Window) -> Option<WindowState> {
-        let pos = window.outer_position().ok()?;
-        let size = window.inner_size();
-        Some(WindowState {
-            x: pos.x,
-            y: pos.y,
-            width: size.width,
-            height: size.height,
-        })
-    }
-
     /// Switches the active artifact to `id`: builds a fresh
     /// [`ArtifactRuntime`] (the artifact is already compiled in the library) and, if
     /// the GPU is attached, runs `activate()`. Audio is untouched. A no-op when `id`
@@ -822,16 +784,32 @@ impl VizApp {
         }
     }
 
-    /// Applies live window mode changes to the OS window and persists them.
+    /// Applies a user-requested window mode change to the OS window and records it
+    /// in the current monitor configuration's profile.
     fn set_window_mode(&mut self, window: &Window, mode: WindowMode) {
         if self.window_mode == mode {
             return;
         }
         self.window_mode = mode;
         apply_window_mode(window, mode);
-        if let Some(hook) = self.on_window_mode_change.as_mut() {
-            hook(mode);
+        self.placement.record_mode(mode, Instant::now());
+    }
+
+    /// Applies the saved placement of a monitor configuration the window just
+    /// switched to (or returned to after a display blip). Goes through the same window-mode path as a user toggle (the
+    /// transparent surface follows [`RenderCallback::wants_transparent_clear`]) but is
+    /// not re-recorded: it already is that configuration's profile.
+    fn apply_placement(&mut self, window: &Window, placement: WindowPlacement) {
+        // Chrome first: adding or removing the titlebar changes the frame, and the
+        // saved geometry describes the window with its saved chrome.
+        if self.window_mode != placement.mode {
+            self.window_mode = placement.mode;
+            apply_window_mode(window, placement.mode);
         }
+        if let Some(geometry) = placement.geometry {
+            apply_window_geometry(window, geometry);
+        }
+        self.size_preset_dirty = true;
     }
 
     /// Builds the GPU renderer and attaches the overlay once the surface format is
@@ -1096,15 +1074,10 @@ impl RenderCallback for VizApp {
                 {
                     match shortcut {
                         WindowShortcut::Resize(preset) => {
+                            // The new size is persisted by the placement tracker's
+                            // next check, like any other resize.
                             apply_window_size_preset(window, preset, self.window_mode.borderless);
                             self.size_preset_dirty = true;
-                            if let (Some(hook), Some(state)) = (
-                                self.on_window_change.as_mut(),
-                                Self::current_window_state(window),
-                            ) {
-                                hook(state);
-                            }
-                            self.last_window_save = None;
                         }
                         WindowShortcut::ToggleBorderless => {
                             let mut next = self.window_mode;
@@ -1156,31 +1129,18 @@ impl RenderCallback for VizApp {
             self.size_preset_dirty = true;
         }
 
-        // Persist window geometry on move/resize, debounced so a drag does not write
-        // on every event.
-        if matches!(event, WindowEvent::Moved(_) | WindowEvent::Resized(_)) {
-            let now = Instant::now();
-            if should_save_window(now, self.last_window_save, WINDOW_SAVE_DEBOUNCE) {
-                if let (Some(hook), Some(state)) = (
-                    self.on_window_change.as_mut(),
-                    Self::current_window_state(window),
-                ) {
-                    hook(state);
-                    self.last_window_save = Some(now);
-                }
-            }
+        // Window geometry is persisted by the placement tracker's periodic check (see
+        // `render`), not per move event: it must first confirm the displays did not
+        // change, or an OS-induced move would overwrite the old setup's placement. A
+        // scale change often means a display came or went, so check right away.
+        if matches!(event, WindowEvent::ScaleFactorChanged { .. }) {
+            self.placement.request_check();
         }
 
-        // Final flush on quit: capture the latest geometry unconditionally so a
-        // move within the debounce window just before closing is not lost.
+        // Final flush on quit, so a move just before closing is not lost.
         if matches!(event, WindowEvent::CloseRequested) {
-            if let (Some(hook), Some(state)) = (
-                self.on_window_change.as_mut(),
-                Self::current_window_state(window),
-            ) {
-                hook(state);
-                self.last_window_save = Some(Instant::now());
-            }
+            self.placement
+                .finish(Instant::now(), self.window_mode, snapshot_window(window));
         }
 
         // `Renderer::render` follows the surface texture size every frame, so a
@@ -1230,6 +1190,12 @@ impl RenderCallback for VizApp {
         if let Some(r) = self.renderer.as_mut() {
             r.recall_staging();
         }
+    }
+
+    fn initial_placement(&mut self, monitors: MonitorConfig) -> WindowPlacement {
+        let placement = self.placement.start(monitors, Instant::now());
+        self.window_mode = placement.mode;
+        placement
     }
 
     fn render(&mut self, frame: &mut FrameContext<'_>) {
@@ -1385,6 +1351,16 @@ impl RenderCallback for VizApp {
             crate::window::MIN_FRAME_INTERVAL
         };
 
+        // Track the connected displays (a timestamp compare on most frames) and restore
+        // the saved placement when they change to a known configuration (or blip back).
+        let window_mode = self.window_mode;
+        if let Some(placement) = self
+            .placement
+            .poll(render_now, window_mode, || snapshot_window(frame.window))
+        {
+            self.apply_placement(frame.window, placement);
+        }
+
         // Fast bypass: once the auto-hidden Active overlay has run one clean hide
         // frame (clearing egui areas + cursor), skip egui entirely until wake.
         let can_skip_overlay =
@@ -1464,17 +1440,9 @@ impl RenderCallback for VizApp {
                 self.set_window_mode(frame.window, mode);
             }
             if let Some(preset) = req.set_size_preset {
+                // Persisted by the placement tracker's next check.
                 apply_window_size_preset(frame.window, preset, self.window_mode.borderless);
                 self.size_preset_dirty = true;
-                // Persist immediately for synchronous resizes and clear the debounce
-                // timer so any ensuing async `Resized` event also persists cleanly.
-                if let (Some(hook), Some(state)) = (
-                    self.on_window_change.as_mut(),
-                    Self::current_window_state(frame.window),
-                ) {
-                    hook(state);
-                }
-                self.last_window_save = None;
             }
             // Apply setting edits / reset to the runtime. Each edit writes straight
             // into the runtime's setting slot, flushed before the next frame's var
@@ -1849,12 +1817,12 @@ mod tests {
 
     #[test]
     fn transparent_clear_requires_both_transparent_mode_and_active_view() {
-        let mut app =
-            VizApp::new(ArtifactLibrary::new(), None, false, None).with_window_mode(WindowMode {
-                borderless: true,
-                transparent: true,
-                always_on_top: true,
-            });
+        let mut app = VizApp::new(ArtifactLibrary::new(), None, false, None);
+        app.window_mode = WindowMode {
+            borderless: true,
+            transparent: true,
+            always_on_top: true,
+        };
         // Before an Active frame has rendered (e.g. guidance screen), clear stays opaque.
         assert!(!app.wants_transparent_clear());
         // Once Active, transparent clear is enabled.

@@ -12,10 +12,19 @@
 //!
 //! The two documents are:
 //!
-//! * `app_state.json` ([`AppState`]) — the last selected artifact id, per-artifact
-//!   setting values, and the top-right overlay's collapsed state.
-//! * `window_state.json` ([`WindowState`]) — the window position + size, so the
-//!   window reopens where it was (winit does not persist this itself).
+//! * `app_state.json` ([`AppState`]) — global state shared by every monitor setup:
+//!   the last selected artifact id, per-artifact setting values, and the top-right
+//!   overlay's collapsed state.
+//! * `window_state.json` ([`crate::placement::WindowProfiles`]) — the window's
+//!   position, size, and chrome flags (borderless, transparent, always on top),
+//!   remembered separately for each monitor configuration (winit does not persist
+//!   any of this itself). Its schema, config key, and hotplug policy are documented
+//!   in [`crate::placement`].
+//!
+//! Older builds kept the chrome flags in `app_state.json` and a single geometry in
+//! `window_state.json`. Those `app_state.json` fields are now ignored when parsing
+//! [`AppState`] (and dropped on its next save); `legacy_window_mode` reads them once
+//! so the first launch after an upgrade seeds a window profile from them.
 //!
 //! ## Save policy
 //! `app_state.json` is small and changes only on discrete user actions (artifact
@@ -26,7 +35,9 @@
 //! quit (so a drag finishing right before a switch/close is never lost). The
 //! debounce decision reuses the same pure helper as the window save,
 //! [`should_save_window`], so it is unit-tested without a clock or filesystem.
-//! `window_state.json` is debounced the same way (it changes on every move/resize).
+//! `window_state.json` is written eagerly on chrome toggles and monitor config
+//! switches, on the [`WINDOW_SAVE_DEBOUNCE`] debounce for geometry changes, and on
+//! quit.
 //!
 //! ## Restore policy
 //! [`AppState::resolve_artifact`] maps the saved `last_artifact_id` to a concrete
@@ -53,6 +64,7 @@ use viz_contract::{ArtifactLibrary, LoadedArtifact, SettingDecl};
 use viz_core::ArtifactId;
 
 use crate::runtime::{default_setting_value, SettingValue};
+use crate::window::WindowMode;
 
 /// Qualifier/organization/application used to resolve the platform config dir.
 /// On macOS `directories` joins these with `.` into the reverse-DNS bundle id
@@ -63,8 +75,12 @@ const QUALIFIER: &str = "io.github";
 const ORGANIZATION: &str = "acrive82";
 const APPLICATION: &str = "viewmusic";
 
-/// Minimum interval between `window_state.json` writes (debounce). Move/resize
-/// events fire far faster than this; we coalesce them, plus a final flush on quit.
+/// File name of [`AppState`] in the config dir.
+const APP_STATE_FILE: &str = "app_state.json";
+
+/// Minimum interval between `window_state.json` geometry writes (debounce). The
+/// window moves far more often than this; writes are coalesced, plus a final flush
+/// on quit.
 pub const WINDOW_SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 
 /// Persisted top-level app state (`app_state.json`).
@@ -84,28 +100,6 @@ pub struct AppState {
     /// Whether the top-right overlay panel is collapsed to its chevron. The
     /// auto-hide timer is *not* persisted — only this explicit collapse state.
     pub overlay_collapsed: bool,
-    /// Whether window decorations (titlebar / borders) are hidden.
-    pub borderless: bool,
-    /// Whether the active visualizer renders over a transparent background.
-    pub transparent: bool,
-    /// Whether the window stays above normal windows.
-    pub always_on_top: bool,
-}
-
-/// Persisted window geometry (`window_state.json`).
-///
-/// Kept separate from [`AppState`] because it changes on every move/resize and is
-/// written on a debounce, whereas [`AppState`] changes only on discrete actions.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-pub struct WindowState {
-    /// Window top-left x in physical pixels (winit outer position).
-    pub x: i32,
-    /// Window top-left y in physical pixels.
-    pub y: i32,
-    /// Window width in physical pixels.
-    pub width: u32,
-    /// Window height in physical pixels.
-    pub height: u32,
 }
 
 impl AppState {
@@ -113,12 +107,12 @@ impl AppState {
     /// unreadable/corrupt (a missing/garbled file must never crash startup —
     /// persistence is best-effort).
     pub fn load() -> Self {
-        read_json::<Self>("app_state.json").unwrap_or_default()
+        read_json::<Self>(APP_STATE_FILE).unwrap_or_default()
     }
 
     /// Saves `app_state.json` (best-effort: a write failure is logged, not fatal).
     pub fn save(&self) {
-        write_json("app_state.json", self);
+        write_json(APP_STATE_FILE, self);
     }
 
     /// Resolves the artifact to activate at launch against the current library:
@@ -129,17 +123,13 @@ impl AppState {
     }
 }
 
-impl WindowState {
-    /// Loads `window_state.json`, or `None` if absent/corrupt (fall back to the
-    /// platform default size + placement).
-    pub fn load() -> Option<Self> {
-        read_json::<Self>("window_state.json")
-    }
-
-    /// Saves `window_state.json` (best-effort).
-    pub fn save(&self) {
-        write_json("window_state.json", self);
-    }
+/// Reads the window chrome flags (`borderless`, `transparent`, `always_on_top`) that
+/// builds before per-monitor window profiles stored at the top level of
+/// `app_state.json`; all `false` when absent. The field names match [`WindowMode`]'s
+/// serialized names, which the window profiles keep for that reason. Used once, to
+/// migrate them into `window_state.json` (see [`crate::placement`]).
+pub(crate) fn legacy_window_mode() -> WindowMode {
+    read_json::<WindowMode>(APP_STATE_FILE).unwrap_or_default()
 }
 
 /// Pure resolution of the launch artifact (extracted for testability).
@@ -158,7 +148,8 @@ pub fn resolve_artifact(saved_id: Option<&str>, library: &ArtifactLibrary) -> Op
     library.first_loaded_id().cloned()
 }
 
-/// Pure debounce decision for a `window_state.json` write (extracted for testing).
+/// Pure debounce decision for a debounced state write (extracted for testing): used
+/// for `window_state.json` geometry and for setting edits in `app_state.json`.
 ///
 /// Returns `true` when there has been no prior write, or at least `debounce` has
 /// elapsed since `last_saved`. The caller records `now` as the new `last_saved` only
@@ -386,7 +377,7 @@ pub fn ensure_artifacts_dir() -> Option<PathBuf> {
 
 /// Reads + deserializes a JSON document from the config dir, or `None` on any
 /// failure (absent file, parse error, no config dir). Best-effort by design.
-fn read_json<T: for<'de> Deserialize<'de>>(file: &str) -> Option<T> {
+pub(crate) fn read_json<T: for<'de> Deserialize<'de>>(file: &str) -> Option<T> {
     let path = config_dir()?.join(file);
     let bytes = match std::fs::read(&path) {
         Ok(b) => b,
@@ -418,7 +409,7 @@ fn read_json<T: for<'de> Deserialize<'de>>(file: &str) -> Option<T> {
 
 /// Serializes + writes a JSON document into the config dir (best-effort; logs on
 /// failure, never panics).
-fn write_json<T: Serialize>(file: &str, value: &T) {
+pub(crate) fn write_json<T: Serialize>(file: &str, value: &T) {
     let Some(dir) = config_dir() else {
         return;
     };
@@ -537,7 +528,6 @@ mod tests {
             last_artifact_id: Some("bravo".to_owned()),
             setting_values: BTreeMap::new(),
             overlay_collapsed: true,
-            ..AppState::default()
         };
         state
             .setting_values
@@ -551,30 +541,29 @@ mod tests {
     }
 
     #[test]
-    fn app_state_window_mode_defaults_from_old_json_and_roundtrips() {
-        // Legacy app_state.json lacking the window-mode fields must default all 3 to false.
-        let legacy = r#"{"last_artifact_id":"alpha","overlay_collapsed":true}"#;
+    fn old_app_state_with_window_flags_still_parses_and_flags_migrate() {
+        // app_state.json written before per-monitor window profiles.
+        let legacy = r#"{"last_artifact_id":"alpha","overlay_collapsed":true,
+            "borderless":true,"transparent":false,"always_on_top":true}"#;
         let restored: AppState = serde_json::from_str(legacy).unwrap();
         assert_eq!(restored.last_artifact_id.as_deref(), Some("alpha"));
         assert!(restored.overlay_collapsed);
-        assert!(!restored.borderless);
-        assert!(!restored.transparent);
-        assert!(!restored.always_on_top);
-
-        // New JSON with all 3 flags set round-trips cleanly.
-        let state = AppState {
-            last_artifact_id: Some("alpha".to_owned()),
-            borderless: true,
-            transparent: true,
-            always_on_top: true,
-            ..AppState::default()
-        };
-        let json = serde_json::to_string(&state).unwrap();
-        let back: AppState = serde_json::from_str(&json).unwrap();
-        assert_eq!(state, back);
-        assert!(back.borderless);
-        assert!(back.transparent);
-        assert!(back.always_on_top);
+        // The flags no longer round-trip through AppState…
+        let json = serde_json::to_string(&restored).unwrap();
+        assert!(!json.contains("borderless"), "{json}");
+        // …but `legacy_window_mode` (same parse as below) still recovers them.
+        let mode: WindowMode = serde_json::from_str(legacy).unwrap();
+        assert_eq!(
+            mode,
+            WindowMode {
+                borderless: true,
+                transparent: false,
+                always_on_top: true,
+            }
+        );
+        // Files that never had the flags yield all-false.
+        let mode: WindowMode = serde_json::from_str(r#"{"overlay_collapsed":true}"#).unwrap();
+        assert_eq!(mode, WindowMode::default());
     }
 
     #[test]
@@ -584,19 +573,6 @@ mod tests {
         assert_eq!(back, AppState::default());
         assert!(back.last_artifact_id.is_none());
         assert!(!back.overlay_collapsed);
-    }
-
-    #[test]
-    fn window_state_roundtrips() {
-        let ws = WindowState {
-            x: 100,
-            y: 200,
-            width: 1280,
-            height: 720,
-        };
-        let json = serde_json::to_string(&ws).unwrap();
-        let back: WindowState = serde_json::from_str(&json).unwrap();
-        assert_eq!(ws, back);
     }
 
     // ---- per-artifact setting persistence -----------------------------------

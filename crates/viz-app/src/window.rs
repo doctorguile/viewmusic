@@ -19,15 +19,28 @@
 //! command encoder + the surface view to the callback (the egui overlay today, the
 //! visualizer + overlay later) which composites on top with `LoadOp::Load`
 //! (loading rather than clearing, so the overlay never wipes the scene beneath it).
+//!
+//! Window placement: before creating the window, [`App`] asks the callback for the
+//! [`WindowPlacement`] to open with, given the connected displays
+//! ([`RenderCallback::initial_placement`]); the per-monitor-config policy behind that
+//! lives in [`crate::placement`]. This module owns the translation between winit
+//! coordinates and that module's *desktop units* ([`monitor_config`],
+//! [`snapshot_window`], [`apply_window_geometry`]).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
 use winit::application::ApplicationHandler;
-use winit::dpi::PhysicalSize;
+use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize, Position, Size};
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
+use winit::monitor::MonitorHandle;
 use winit::window::{Window, WindowId, WindowLevel};
+
+use crate::placement::{
+    MonitorConfig, MonitorDescriptor, WindowGeometry, WindowPlacement, WindowSnapshot,
+};
 
 /// Hard 60 Hz frame budget. Presents closer together than this are skipped so the
 /// effective update rate stays at 60 even on 120 Hz displays.
@@ -36,7 +49,8 @@ use winit::window::{Window, WindowId, WindowLevel};
 /// a skip — we use 15.5 ms.
 pub const MIN_FRAME_INTERVAL: Duration = Duration::from_micros(15_500);
 
-/// Initial logical window size (physical size is derived via the scale factor).
+/// Logical window size used when there is no saved geometry (physical size is
+/// derived via the scale factor).
 const INITIAL_WIDTH: u32 = 1280;
 const INITIAL_HEIGHT: u32 = 720;
 
@@ -268,10 +282,24 @@ pub trait RenderCallback {
     /// Invoked immediately after `queue.submit(...)` so the renderer can recall
     /// `StagingBelt` buffers for reuse on the next frame.
     fn on_post_submit(&mut self) {}
+
+    /// Called once, just before the window is created, with the displays connected
+    /// at that moment. Returns the geometry and chrome to create the window with;
+    /// `geometry: None` uses the platform default size and placement. The returned
+    /// geometry is applied as is, so it should already be visible on `monitors`
+    /// (see [`MonitorConfig::fit`]).
+    fn initial_placement(&mut self, _monitors: MonitorConfig) -> WindowPlacement {
+        WindowPlacement::default()
+    }
 }
 
 /// Live-toggleable window presentation flags.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+///
+/// Persisted per monitor configuration (see [`crate::placement`]); the serialized
+/// field names are also what old builds wrote into `app_state.json`, so they must
+/// not change.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct WindowMode {
     /// Hide window chrome (titlebar / borders); drag canvas to move.
     pub borderless: bool,
@@ -444,47 +472,121 @@ pub fn apply_window_size_preset(window: &Window, preset: WindowSizePreset, borde
 /// GPU-dependent resources (e.g. the egui renderer needs the surface format).
 type ReadyHook<C> = Box<dyn FnOnce(&GpuContext, &Window, &mut C)>;
 
-/// Restored window geometry to apply at creation: outer position + inner size, both
-/// in physical pixels. Supplied by the host from persisted state.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct InitialWindow {
-    /// Outer-position x in physical pixels.
-    pub x: i32,
-    /// Outer-position y in physical pixels.
-    pub y: i32,
-    /// Inner width in physical pixels.
-    pub width: u32,
-    /// Inner height in physical pixels.
-    pub height: u32,
+/// Whether desktop units (see [`crate::placement`]) are logical points on this
+/// platform. On macOS AppKit places every window and display on one point grid;
+/// winit's physical coordinates there are each display's points times *that*
+/// display's scale factor, which do not form a single space across mixed-DPI
+/// displays. Elsewhere (Windows virtual screen, X11) physical pixels are global.
+const DESKTOP_UNITS_ARE_LOGICAL: bool = cfg!(target_os = "macos");
+
+/// winit physical pixels per desktop unit for a display or window with winit scale
+/// factor `scale_factor`.
+fn physical_px_per_unit(scale_factor: f64) -> f64 {
+    if DESKTOP_UNITS_ARE_LOGICAL {
+        scale_factor
+    } else {
+        1.0
+    }
 }
 
-/// Clamps a restored [`InitialWindow`]'s physical dimensions to at least `1×1` and
-/// at most the largest available monitor's physical `(width, height)`.
-///
-/// Pure function so it is unit-testable. Protects against stale or corrupt persisted
-/// state (e.g. a cross-monitor double-scaled `6912×2104` entry) opening an oversized
-/// off-screen window. When `max_monitor_size` is `None`, only enforces the `>= 1` floor.
-#[must_use]
-pub fn clamp_initial_window(
-    win: InitialWindow,
-    max_monitor_size: Option<(u32, u32)>,
-) -> InitialWindow {
-    let mut width = win.width.max(1);
-    let mut height = win.height.max(1);
-    if let Some((max_w, max_h)) = max_monitor_size {
-        if max_w > 0 {
-            width = width.min(max_w);
-        }
-        if max_h > 0 {
-            height = height.min(max_h);
-        }
+/// Converts a winit physical coordinate to desktop units.
+fn to_desktop_units(physical: f64, scale_factor: f64) -> f64 {
+    (physical / physical_px_per_unit(scale_factor)).round()
+}
+
+/// `geometry`'s outer position as a winit [`Position`] (desktop units are logical
+/// points on macOS, physical pixels elsewhere).
+fn desktop_position(geometry: WindowGeometry) -> Position {
+    if DESKTOP_UNITS_ARE_LOGICAL {
+        LogicalPosition::new(f64::from(geometry.x), f64::from(geometry.y)).into()
+    } else {
+        PhysicalPosition::new(geometry.x, geometry.y).into()
     }
-    InitialWindow {
-        x: win.x,
-        y: win.y,
-        width,
-        height,
+}
+
+/// `geometry`'s inner size as a winit [`Size`] (see [`desktop_position`]).
+fn desktop_size(geometry: WindowGeometry) -> Size {
+    if DESKTOP_UNITS_ARE_LOGICAL {
+        LogicalSize::new(f64::from(geometry.width), f64::from(geometry.height)).into()
+    } else {
+        PhysicalSize::new(geometry.width, geometry.height).into()
     }
+}
+
+/// Describes `monitors` (e.g. `ActiveEventLoop::available_monitors`) as a
+/// [`MonitorConfig`] in desktop units. Allocates and queries the window server;
+/// call at a low rate.
+pub fn monitor_config(monitors: impl Iterator<Item = MonitorHandle>) -> MonitorConfig {
+    MonitorConfig::new(
+        monitors
+            .map(|m| {
+                let scale = m.scale_factor();
+                let position = m.position();
+                let size = m.size();
+                MonitorDescriptor {
+                    name: m.name().unwrap_or_else(|| "unnamed".to_owned()),
+                    x: to_desktop_units(f64::from(position.x), scale) as i32,
+                    y: to_desktop_units(f64::from(position.y), scale) as i32,
+                    width: to_desktop_units(f64::from(size.width), scale) as u32,
+                    height: to_desktop_units(f64::from(size.height), scale) as u32,
+                    physical_px_per_unit: physical_px_per_unit(scale),
+                }
+            })
+            .collect(),
+    )
+}
+
+/// The displays connected at launch. Falls back to the primary monitor when the
+/// enumeration is empty (seen transiently while displays reconfigure); the result is
+/// still empty when winit reports neither, which [`crate::placement`] handles by
+/// deferring the launch configuration to the first non-empty check.
+fn launch_monitor_config(event_loop: &ActiveEventLoop) -> MonitorConfig {
+    let monitors = monitor_config(event_loop.available_monitors());
+    if monitors.is_empty() {
+        monitor_config(event_loop.primary_monitor().into_iter())
+    } else {
+        monitors
+    }
+}
+
+/// Captures the connected displays and `window`'s geometry in desktop units. The
+/// geometry is `None` while minimized (zero size; Windows also parks minimized
+/// windows at -32000,-32000) or when the platform cannot report a position.
+pub fn snapshot_window(window: &Window) -> WindowSnapshot {
+    let size = window.inner_size();
+    let minimized = size.width == 0 || size.height == 0 || window.is_minimized() == Some(true);
+    let geometry = if minimized {
+        None
+    } else {
+        window.outer_position().ok().map(|position| {
+            let scale = window.scale_factor();
+            WindowGeometry {
+                x: to_desktop_units(f64::from(position.x), scale) as i32,
+                y: to_desktop_units(f64::from(position.y), scale) as i32,
+                width: to_desktop_units(f64::from(size.width), scale) as u32,
+                height: to_desktop_units(f64::from(size.height), scale) as u32,
+            }
+        })
+    };
+    WindowSnapshot {
+        monitors: monitor_config(window.available_monitors()),
+        geometry,
+    }
+}
+
+/// Moves and resizes an existing window to `geometry` (desktop units), leaving the
+/// maximized state first so the rect is not overridden.
+pub fn apply_window_geometry(window: &Window, geometry: WindowGeometry) {
+    if window.is_maximized() {
+        window.set_maximized(false);
+    }
+    // Position, size, position: on macOS a content resize keeps the bottom-left
+    // corner (Cocoa's origin), moving the top edge; on Windows moving onto a display
+    // with another DPI rescales the window, so the size must come after the move.
+    // The second move is a no-op wherever the first one stuck.
+    window.set_outer_position(desktop_position(geometry));
+    let _ = window.request_inner_size(desktop_size(geometry));
+    window.set_outer_position(desktop_position(geometry));
 }
 
 /// Decides whether to present this redraw given the hard 60 Hz cap.
@@ -556,11 +658,6 @@ pub struct App<C: RenderCallback> {
     /// Hook invoked exactly once after the GPU context first exists, so the host can
     /// build GPU-dependent resources (e.g. the egui renderer needs the surface format).
     on_ready: Option<ReadyHook<C>>,
-    /// Restored geometry to apply when the window is created; `None` ⇒ use
-    /// the platform default size + placement.
-    initial_window: Option<InitialWindow>,
-    /// Initial window mode (borderless, transparent, always-on-top) applied at creation.
-    window_mode: WindowMode,
 }
 
 impl<C: RenderCallback> App<C> {
@@ -578,8 +675,6 @@ impl<C: RenderCallback> App<C> {
             minimized: false,
             wake_immediately: false,
             on_ready: None,
-            initial_window: None,
-            window_mode: WindowMode::default(),
         }
     }
 
@@ -587,20 +682,6 @@ impl<C: RenderCallback> App<C> {
     /// can build GPU-format-dependent state such as the egui renderer).
     pub fn on_ready(mut self, f: impl FnOnce(&GpuContext, &Window, &mut C) + 'static) -> Self {
         self.on_ready = Some(Box::new(f));
-        self
-    }
-
-    /// Restores the window's geometry from persisted state. When set, the
-    /// window opens at the saved position + size instead of the platform default.
-    pub fn with_initial_window(mut self, initial: Option<InitialWindow>) -> Self {
-        self.initial_window = initial;
-        self
-    }
-
-    /// Sets the initial [`WindowMode`] (borderless, transparent, always-on-top) applied
-    /// when the window is created.
-    pub fn with_window_mode(mut self, mode: WindowMode) -> Self {
-        self.window_mode = mode;
         self
     }
 
@@ -701,7 +782,10 @@ impl<C: RenderCallback> ApplicationHandler for App<C> {
             return;
         }
 
-        let mode = self.window_mode;
+        let placement = self
+            .callback
+            .initial_placement(launch_monitor_config(event_loop));
+        let mode = placement.mode;
         // An opaque window lets the compositor skip what is behind it; Transparent
         // mode toggles it live via `apply_window_mode`.
         let mut attrs = Window::default_attributes()
@@ -721,27 +805,14 @@ impl<C: RenderCallback> ApplicationHandler for App<C> {
                 .with_has_shadow(!mode.transparent)
                 .with_accepts_first_mouse(true);
         }
-        // Restore persisted geometry (physical px) when available, clamped to the
-        // largest available monitor so stale/oversized state never opens off-screen.
-        let max_monitor_size = event_loop
-            .available_monitors()
-            .chain(event_loop.primary_monitor())
-            .map(|m| m.size())
-            .fold(None, |acc: Option<(u32, u32)>, sz| {
-                Some(match acc {
-                    Some((w, h)) => (w.max(sz.width), h.max(sz.height)),
-                    None => (sz.width, sz.height),
-                })
-            });
-        match self.initial_window {
-            Some(win) => {
-                let win = clamp_initial_window(win, max_monitor_size);
+        match placement.geometry {
+            Some(geometry) => {
                 attrs = attrs
-                    .with_inner_size(PhysicalSize::new(win.width, win.height))
-                    .with_position(winit::dpi::PhysicalPosition::new(win.x, win.y));
+                    .with_inner_size(desktop_size(geometry))
+                    .with_position(desktop_position(geometry));
             }
             None => {
-                attrs = attrs.with_inner_size(winit::dpi::LogicalSize::new(
+                attrs = attrs.with_inner_size(LogicalSize::new(
                     INITIAL_WIDTH as f64,
                     INITIAL_HEIGHT as f64,
                 ));
@@ -752,6 +823,12 @@ impl<C: RenderCallback> ApplicationHandler for App<C> {
                 .create_window(attrs)
                 .expect("failed to create window"),
         );
+        if let Some(geometry) = placement.geometry {
+            // macOS treats the creation position as the *content* rect's top-left, so
+            // a titled window would open one titlebar higher than it was saved;
+            // re-apply it as the outer (frame) position, which is what is saved.
+            window.set_outer_position(desktop_position(geometry));
+        }
 
         let size = window.inner_size();
         let gpu = GpuContext::new(window.clone(), size);
@@ -1024,53 +1101,6 @@ mod tests {
             detect_size_preset((1911.0, 1080.0), false, Some((1920.0, 1080.0))),
             None
         );
-    }
-
-    #[test]
-    fn clamp_initial_window_caps_oversized_state_to_monitor_bounds() {
-        // Stale double-scaled 6912×2104 state gets clamped to a 3456×2234 Retina monitor.
-        let oversized = InitialWindow {
-            x: 0,
-            y: 130,
-            width: 6912,
-            height: 2104,
-        };
-        assert_eq!(
-            clamp_initial_window(oversized, Some((3456, 2234))),
-            InitialWindow {
-                x: 0,
-                y: 130,
-                width: 3456,
-                height: 2104,
-            }
-        );
-
-        // Normal size within bounds passes through unchanged.
-        let normal = InitialWindow {
-            x: 100,
-            y: 80,
-            width: 1280,
-            height: 720,
-        };
-        assert_eq!(clamp_initial_window(normal, Some((3456, 2234))), normal);
-
-        // Zero dimensions are floored to 1; missing monitor info keeps valid size.
-        let zero = InitialWindow {
-            x: 0,
-            y: 0,
-            width: 0,
-            height: 0,
-        };
-        assert_eq!(
-            clamp_initial_window(zero, None),
-            InitialWindow {
-                x: 0,
-                y: 0,
-                width: 1,
-                height: 1,
-            }
-        );
-        assert_eq!(clamp_initial_window(normal, None), normal);
     }
 
     #[test]

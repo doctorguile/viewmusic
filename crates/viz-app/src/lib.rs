@@ -12,7 +12,9 @@
 //! - [`viz`]: the composite audio → runtime → renderer → overlay
 //!   callback, including artifact switching from the dropdown, live setting
 //!   edits, and the "Reload artifacts" re-scan action.
-//! - [`persist`]: persisted app + window state.
+//! - [`persist`]: persisted app state and the config-dir JSON plumbing.
+//! - [`placement`]: window geometry + chrome remembered per monitor configuration
+//!   (`window_state.json`, display hotplug handling).
 //! - [`window`]/[`overlay`]/[`logging`]: the windowing shell; `overlay` also owns the
 //!   overlay auto-hide/collapse logic.
 //! - [`hud`]: optional perf HUD (behind the `perf-hud` feature).
@@ -23,6 +25,7 @@ pub mod hud;
 pub mod logging;
 pub mod overlay;
 pub mod persist;
+pub mod placement;
 pub mod runtime;
 pub mod settings_panel;
 pub mod viz;
