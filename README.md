@@ -4,6 +4,14 @@ A Winamp-style real-time music visualizer for macOS, Windows and Linux. It liste
 playing on your machine — any app, no loopback drivers, no audio routing — and renders
 colorful, beat-reactive visuals at a hard 60 fps with low audio-to-photon latency.
 
+<p align="center">
+  <img src="docs/media/retro-spectrum-demo.svg" alt="ViewMusic Retro Spectrum Bars live preview (Sony MHC-RX90 VFD)" width="840" />
+  <br />
+  <sub>
+    Preview of the built-in <a href="assets/builtin-artifacts/retro-spectrum-bars.artifact.json">Retro Spectrum Bars</a> artifact (Sony MHC-RX90 VFD) — rendered natively at 60 fps with live system audio and 7 switchable 1990s hi-fi decks.
+  </sub>
+</p>
+
 Visualizations ("artifacts") are **plain JSON files**: declarative scenes whose geometry,
 motion, and color are mathematical formulas over the live audio features (48-band spectrum,
 waveform, loudness, beat events), time, and your own settings. Write your own with nothing
